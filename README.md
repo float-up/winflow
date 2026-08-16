@@ -1,135 +1,104 @@
 # winflow
 
-一个轻量级 macOS 窗口切换器（Rust 编写）
+[简体中文](README.zh-CN.md) | **English**
 
-完全为了解决个人日常工作中，窗口切换的痛点而开发
+> A lightweight macOS window switcher, written in Rust.
 
-设计思路：
+winflow fills the gaps in the system's built-in `⌘Tab`: live window thumbnails, grouping by desktop (Space), MRU ordering, and multiple ways to move around — `hjkl`, arrow keys, or the mouse. It's light on resources and instant to summon, even on first use.
 
-- 不支持自定义快捷键，仅有两种快捷键：`⌘ Tab` 和 `⌘ \``（直接覆盖系统快捷键）
-  
-  - `⌘ Tab`: 当前桌面活跃窗口间的切换
-  
-  - `⌘ \``: 当前桌面聚焦的程序的多个窗口之间切换
+## Design Philosophy
 
-- 所有切换逻辑，仅针对活跃窗口，不包括 `⌘ M` 隐藏的，也不包括仅仅 `⌘ W` 关闭的窗口（程序本身未 `⌘ Q` 退出）
+Window switchers keep getting richer in features, yet the one thing that actually matters — switching from one window to another — is often the worst part: the moment your desktop gets busy, they lag and stutter. That's getting the priorities backwards. winflow does one thing, and does it well:
 
-- 软件唤起时，会显示当前桌面所有活跃窗口的缩略图，这个缩略图只是为了能加明确、迅速地定位要切换过去的窗口，因此***没必要保证实时性**
+- **Two fixed hotkeys, overriding the system.** There are only two: `⌘Tab` (all active windows on the current desktop) and ````⌘\` ```` (all windows of the frontmost app on the current desktop). The system switcher is intercepted at the HID layer, so there are no hotkeys to configure — it just works out of the box.
+- **Active windows only.** The switcher only ever shows the active windows on the current display's current desktop — nothing hidden with `⌘M`, nothing minimized, and nothing merely closed with `⌘W` (the app itself still running).
+- **Thumbnails are for locating, not for live preview.** The overlay shows a thumbnail of every active window on the desktop so you can see exactly where you're going. That's why they don't need to be real-time: they're captured asynchronously in the background — a full pass warms the cache at startup, and afterwards only changed windows are refreshed on a fixed schedule, so we never spam the screen-capture API.
+- **⌘ is everything.** Tap `⌘Tab` / ````⌘\` ```` and release ⌘ quickly → instant switch back to the previous window, no UI at all. Hold ⌘ → the overlay appears and the selection follows you; release ⌘ → the highlighted window is activated automatically. No mouse, no Enter, no explicit confirmation.
+- **Keep your right hand on the keyboard.** The overlay is designed to minimize mouse travel: `hjkl` Vim-style navigation is recommended, with arrow keys, `Tab` / `Shift+Tab`, the scroll wheel, and hover-to-select (no click needed) as alternatives.
+- **A menu bar with just two items.** "Configure…" and "Quit winflow". The menu bar icon mostly exists just to tell you the app is still running.
+- **No unnecessary options.** A focused tool should be effortless — winflow ships with sane defaults and works out of the box.
+- **Performance first.** The execution path is heavily optimized so that even a desktop full of windows switches without stutter — on first summon, on window changes, and everywhere in between.
 
-- 缩略图是后台异步进程截取的，软件启动时会立刻全量截取一次，新建的窗口会截取一次；为避免高频截图，窗口变化不会立刻触发缩略图截取，后台进程会定时截取，然后更新发生变化的窗口
+This project is built entirely with Pi + DeepSeek V4, with no Pi plugins or skills installed.
 
-- cmd 会控制软件行为：
-  
-  - 如果快速按下 `⌘ Tab` / `⌘ \`` 并松开 `⌘`，触发快速切换窗口逻辑，默认切换到上一个聚焦的窗口，应对需要在两个窗口间来回高频切换的场景，无需唤出缩略图界面
+## Features
 
-  - 如果按下快捷键后不松开 `⌘` 键，会持续显示活跃窗口的缩略图，选中的窗口会显示边框，松开 `⌘` 后即自动切换到目标窗口，无需鼠标点击/Enter 等确认操作
+- **Background thumbnail capture, pre-warmed at launch.** A background thread starts capturing visible windows from the moment the app starts and caches them in shared memory, so the overlay has thumbnails ready on the very first summon — no lag. The refresh interval defaults to **45s** and can be adjusted in the "Configure…" panel (1–3600s); the setting is **persisted across restarts**.
+- **Quick switching.** Tap `⌘Tab` / ````⌘\` ```` (release ⌘ within the judgment delay) to jump straight back to the previous window without showing the overlay; hold longer to bring it up. The delay defaults to **0.08s** and is adjustable in the panel.
+- **The overlay follows ⌘.** Hold ⌘ and the thumbnails stay on screen (even with nothing selected); **release ⌘ and the selected window is activated automatically** — no Enter or click required.
+- **MRU ordering.** The list is ordered by recency — switch from A to B, summon again and A is pre-selected; press once more to get back to B. Fast round-trips between two (or more) windows.
+- **Equal-height, variable-width thumbnails.** Height is fixed and width follows each window's aspect ratio, so a row can fit several windows.
+- **Multiple navigation styles.** Arrow keys / `hjkl` / `Tab` / `Shift+Tab` / scroll wheel, with **edge wrapping**.
+- **Hover to select.** The mouse behaves exactly like the keyboard — hover to select with a highlight box that follows instantly, click to switch.
+- **Junk-window filtering.** Windows that shouldn't be switch targets are filtered out automatically (e.g., Feishu's watermark layer: untitled, fully contained by a larger window of the same app, transparent, or too small).
 
-- 在缩略图界面，有多种方式可以选择要切换到的窗口，为了**减少右手移动的范围**，推荐使用 `hjkl` Vim 风格导航键来切换，同时也支持方向键和鼠标光标（无需点击，移动光标即可）
-
-- 软件的菜单只会保留两项，配置页面和退出按钮，实际上菜单栏的图标大部分作用只是为了告诉用户，这个软件还在运行
-
-- 去除一切不必要的配置项，永远不会使用配置文件。一个核心功能明确且单一的软件，就要最大程序得降低用户使用上的心智负担，开箱即用
-
-- 软件**执行逻辑**整体做了最大程度的优化，避免在有大量窗口的桌面，首次启动切换/程序窗口更新等场景出现轻微卡顿
-
-
-最后一点也是这个软件设计的出发点，某些窗口切换软件迭代得功能越来越丰富，但最基本、最核心的窗口切换能力却有着使用体验上的大问题，窗口一多就卡顿，舍本逐末
-
-本项目完全使用 Pi + DeepSeek V4 构建，未安装任何 Pi 的插件/skill
-
-## 功能
-
-- 后台定时截取活跃窗口缩略图（**启动即预热**：后台从启动起就持续截取当前
-  可见窗口，缓存到共享内存，首次唤起即有缩略图、不卡顿），间隔默认 **10s**，
-  可通过菜单栏「配置…」面板调整，**设置持久化**（重启后保持）。
-- **快速切换**：轻点 `⌘Tab` / `⌘\``（在判定延迟内松开 ⌘）直接切回上一个
-  窗口，不弹界面；长按才弹出缩略图。判定延迟默认 **0.2s**，
-  可在「配置…」面板调整。
-- **叠加层随 ⌘ 显隐**：按住 ⌘ 就一直展示缩略图（即便没有选择窗口）；
-  **松开 ⌘ 自动切换到选中框选中的窗口**（无需回车/点选确认）。
-- **MRU 排序**：列表按最近使用排列——从 A 切到 B 后再次唤起，默认选中 A，
-  再按一次即回到 B，两窗/多窗快速往返。
-- 缩略图**等高、不等宽**（按窗口宽高比），一行可放多个窗口。
-- 方向键 / `hjkl` / `Tab` / `Shift+Tab` / 滚轮导航，**边界环绕**。
-- 鼠标悬停即选中（与键盘选择等价，选中框即时跟随）；点选切换。
-- 异常窗口过滤（如飞书水印层：无标题、被包含、透明、过小）。
-
-## 构建与运行
+## Building and Running
 
 ```bash
 cargo build --release
-./target/release/winflow          # 前台运行（Ctrl+C 退出）
+./target/release/winflow          # run in the foreground (Ctrl+C to quit)
 ```
 
-## 打包为 .app
+## Packaging as a .app
 
 ```bash
-./package.sh              # 打包到 dist/winflow.app（含图标、Info.plist、ad-hoc 签名）
-./package.sh --install    # 打包并安装到 /Applications
-./package.sh --open       # 打包并启动
+./package.sh              # build & package to dist/winflow.app (icon, Info.plist, ad-hoc signing)
+./package.sh --install    # package and install to /Applications
+./package.sh --open       # package and launch
 ```
 
-首次运行后到 系统设置 → 隐私与安全性 勾选 辅助功能 与 屏幕录制 即可。
+After the first run, grant winflow **Accessibility** and **Screen Recording** permissions in System Settings → Privacy & Security.
 
-图标源文件在 `assets/icon.png`（替换后重新打包即可）。
+The icon source lives in `assets/icon.png` — replace it and re-package.
 
-开发调试：
+Development / debugging:
 
 ```bash
-./target/release/winflow --show               # 2 秒后弹一次切换器
-./target/release/winflow --panel              # 2 秒后弹出设置面板
-./target/release/winflow --force-perm-dialog  # 强制弹出权限提示框（验证 UI）
-WINFLOW_RENDER_OUT=/tmp/out.png ./target/release/winflow --show  # 导出合成画面为 PNG
+./target/release/winflow --show               # pop the switcher once after 2s
+./target/release/winflow --panel              # open the settings panel after 2s
+./target/release/winflow --force-perm-dialog  # force the permission dialog (for UI testing)
+WINFLOW_RENDER_OUT=/tmp/out.png ./target/release/winflow --show  # dump the composed overlay to a PNG
 ```
 
-## 权限（必需）
+## Permissions (Required)
 
-**winflow 每次启动都会自动检测以下两项权限**，缺失时会主动弹出提示框，
-点击按钮直达对应系统设置页：
+**winflow checks for the following two permissions at every launch**, and proactively shows a dialog with buttons that jump straight to the relevant System Settings pane:
 
-1. **辅助功能（Accessibility）**：用于拦截 `⌘Tab` / `⌘\``（覆盖系统）
-   以及窗口置前/聚焦（AX）。
-2. **屏幕录制（Screen Recording）**：用于显示窗口缩略图与标题。
+1. **Accessibility** — to intercept `⌘Tab` / ````⌘\` ```` at the HID layer (overriding the system switcher) and to raise/focus windows (AX).
+2. **Screen Recording** — to display window thumbnails and titles.
 
-> 授权后需重启 winflow（命令行方式运行时，权限授予终端；.app 方式运行时，
-> 权限授予 winflow 本身）。
+> After granting permission, restart winflow: when run from the command line, the permission is granted to your terminal; when run as a .app, it's granted to winflow itself.
 
-## 使用
+## Usage
 
-| 按键 | 作用 |
+| Key | Action |
 | --- | --- |
-| `⌘Tab` 轻点 | 直接切回上一个窗口（不弹界面） |
-| `⌘Tab` 长按 | 打开模式 1（覆盖系统）；已打开时循环下一个 |
-| `⌘\`` 轻点/长按 | 同上，针对当前程序窗口 |
-| `⌘⇧Tab` | 打开模式 1（向后） |
-| `Tab` / `Shift+Tab` | 下一个 / 上一个 |
-| `←↑↓→` / `hjkl` | 网格移动（边界环绕） |
-| `Return` | 切换到选中窗口 |
-| `Esc` | 取消 |
-| 鼠标 | 悬停即选中，点选切换；点空白取消 |
-| 滚轮 | 上一个 / 下一个 |
-| 松开 `⌘` | 自动切换到选中框选中的窗口并关闭叠加层 |
+| `⌘Tab` tap | Switch back to the previous window (no overlay) |
+| `⌘Tab` hold | Open mode 1 (all active windows on the current desktop, overriding the system); when already open, advance to the next |
+| ````⌘\` ```` tap / hold | Same as above, for the frontmost app's windows |
+| `⌘⇧Tab` | Open mode 1 (backwards) |
+| `Tab` / `Shift+Tab` | Next / previous |
+| `←↑↓→` / `hjkl` | Move through the grid (edge wrapping) |
+| `Return` | Switch to the selected window |
+| `Esc` | Cancel |
+| Mouse | Hover to select, click to switch; click empty space to cancel |
+| Scroll wheel | Previous / next |
+| Release `⌘` | Switch to the highlighted window and close the overlay |
 
-菜单栏图标 → 「配置…」面板：
-- 缩略图更新间隔（秒，1–3600，默认 45）
-- 快捷键判定延迟（秒，0.05–2.0，默认 0.08）——松开 ⌘ 快于此值直接切换
-  上一个窗口，慢于此值弹出缩略图界面
+Menu bar icon → "Configure…" panel:
 
-面板点「确定」后设置写入 `~/Library/Application Support/winflow/settings.conf`
-（纯文本，重启保持；删除该文件即恢复默认）。
+- **Thumbnail refresh interval** (seconds, 1–3600, default **45**)
+- **Hotkey judgment delay** (seconds, 0.05–2.0, default **0.08**) — release ⌘ faster than this to switch straight to the previous window; slower to show the overlay
 
-「退出 winflow」：退出应用（不占用系统快捷键）。
+Clicking "OK" writes the settings to `~/Library/Application Support/winflow/settings.conf` (plain text, persisted across restarts; delete the file to reset to defaults).
 
-## 工作原理（简述）
+"Quit winflow" exits the app and releases the system hotkeys.
 
-- 全局 `CGEventTap`（HID 层）拦截 `⌘Tab`/`⌘\`` 及导航键，只修改共享状态
-  `Core`，再向主线程投递命令。
-- 主线程合成整块网格为一张 NSImage（bottom-left 坐标），塞进无边框透明
-  NSWindow（级别 101，可加入所有 Space）。
-- 后台线程按间隔抓取窗口图（`CGWindowListCreateImage` + 立即缩放），缓存按
-  窗口 id 存储，主线程按 gen 失效重建 NSImage。
-- 切换激活：AX 置前 + 设焦点窗口，失败则回退 App 激活
-  （`activateWithOptions(.ActivateAllWindows)`）。
+## How It Works (in a Nutshell)
 
+- A global `CGEventTap` (HID layer) intercepts `⌘Tab` / ````⌘\` ```` and the navigation keys, mutating only the shared `Core` state and dispatching commands to the main thread.
+- The main thread composes the whole grid into a single NSImage (bottom-left coordinates) inside a borderless, transparent NSWindow (level 101, joinable on all Spaces).
+- Background threads grab window images on a schedule (`CGWindowListCreateImage` + immediate downscale), cached by window id; the main thread rebuilds the NSImage on generation invalidation, so a cached thumbnail makes the first summon instant.
+- Activation: AX raise + focus the target window, falling back to app activation (`activateWithOptions(.ActivateAllWindows)`).
 
-详细设计约束与工程约定见 [AGENTS.md](AGENTS.md)。
+Detailed design constraints and engineering conventions: [AGENTS.md](AGENTS.md).
