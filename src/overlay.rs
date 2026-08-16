@@ -70,6 +70,8 @@ pub struct AppInner {
     /// Fingerprint of the display's visible windows (for desktop-change
     /// detection while the overlay is visible).
     last_window_ids: Vec<u32>,
+    /// Transient hint drawn in the overlay (tag feedback / first-`p` cue).
+    hint: Option<(String, Instant)>,
 }
 
 unsafe impl Send for AppInner {}
@@ -90,6 +92,9 @@ static QUICK_DELAY_MS: std::sync::atomic::AtomicU64 =
 /// `frontmost_pid` can lag briefly and would otherwise make a rapid second tap
 /// a no-op.
 const ACTIVATE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// How long tag feedback / hint text stays visible in the overlay.
+const HINT_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 
 pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbCache>>) {
     {
@@ -128,6 +133,7 @@ pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbC
         last_gc: Instant::now(),
         display_id: 0,
         last_window_ids: Vec::new(),
+        hint: None,
     }));
 }
 
@@ -203,6 +209,12 @@ impl AppInner {
                 // full redraws. Coalesce into the next tick.
                 self.thumb_dirty = true;
             }
+            MainCmd::ToggleTag(id) => self.toggle_tag(id),
+            MainCmd::ActivateTag(n) => self.activate_tag(n),
+            MainCmd::TagHint(s) => {
+                self.set_hint(s);
+                self.redraw();
+            }
             MainCmd::OpenPanel => crate::menubar::open_panel_for_test(),
             MainCmd::PermDialog => crate::permissions::prompt_for_test(),
             MainCmd::Tick => self.tick(),
@@ -220,6 +232,8 @@ impl AppInner {
     fn show(&mut self, mode: Mode) {
         self.ensure_panel();
         self.warn_permissions();
+        // A fresh overlay starts without a stale hint from a previous session.
+        self.hint = None;
         // Re-detect the display under the cursor: the overlay opens on the
         // display where the hotkey was pressed, scoped to that display's
         // current desktop.
@@ -478,6 +492,85 @@ impl AppInner {
         self.activate_item(target);
     }
 
+    // ---------- tags (quick entries) ----------
+
+    /// Show a transient hint in the overlay (auto-expires after HINT_DURATION).
+    fn set_hint(&mut self, text: String) {
+        self.hint = Some((text, Instant::now() + HINT_DURATION));
+    }
+
+    /// Double-`p` on the selected window: add its quick-entry tag, or remove
+    /// it when already tagged. Slots are never compacted; a new tag takes the
+    /// lowest free slot (free = empty, or its window closed), and the limit
+    /// (MAX_TAGS) shows a hint instead of adding.
+    fn toggle_tag(&mut self, window_id: u32) {
+        // Query liveness BEFORE taking the Core lock: the CGWindowList call is
+        // comparatively slow, so keep the lock hold short.
+        let alive = windows::window_ids_all();
+        let mut core = self.shared.lock().unwrap();
+
+        // Already tagged → remove (toggle).
+        if let Some(slot) = core.tags.iter().position(|t| *t == Some(window_id)) {
+            core.tags[slot] = None;
+            let n = slot + 1;
+            drop(core);
+            self.set_hint(format!("已移除标签 {}", n));
+            self.redraw();
+            return;
+        }
+
+        match crate::state::free_tag_slot(&core.tags, |w| alive.contains(&w)) {
+            Some(slot) => {
+                core.tags[slot] = Some(window_id);
+                let n = slot + 1;
+                drop(core);
+                self.set_hint(format!("已添加标签 {}（⌘⇧{} 快速切换）", n, n));
+            }
+            None => {
+                drop(core);
+                self.set_hint(format!("标签已达上限（最多 {} 个）", crate::state::MAX_TAGS));
+            }
+        }
+        self.redraw();
+    }
+
+    /// `⌘⇧1/2/3`: switch straight to the tagged window (any display, current
+    /// Spaces). Frees a slot when its window has closed; a window that merely
+    /// lives on another Space is out of scope (CGWindowList is on-screen
+    /// only) and gets a hint instead.
+    fn activate_tag(&mut self, n: usize) {
+        let id = {
+            let core = self.shared.lock().unwrap();
+            core.tags.get(n - 1).copied().flatten()
+        };
+        let Some(id) = id else {
+            self.set_hint(format!("标签 {} 未设置（⌘⇧{}）", n, n));
+            self.redraw();
+            return;
+        };
+        // Global on-screen set across all displays (current Spaces).
+        let items = windows::collect(&self.cfg, Mode::Space, std::process::id(), None);
+        if let Some(item) = items.iter().find(|i| i.id == id).cloned() {
+            self.activate_item(item);
+            return;
+        }
+        // Not visible on any display: the window either closed or is parked
+        // on another Space. Free the slot only when it is truly gone.
+        let alive = windows::window_ids_all().contains(&id);
+        if !alive {
+            let mut core = self.shared.lock().unwrap();
+            if core.tags.get(n - 1) == Some(&Some(id)) {
+                core.tags[n - 1] = None;
+            }
+        }
+        self.set_hint(if alive {
+            format!("标签 {}：窗口不在当前桌面", n)
+        } else {
+            format!("标签 {}：窗口已关闭，已清除该标签", n)
+        });
+        self.redraw();
+    }
+
     // ---------- rendering ----------
 
     fn redraw(&mut self) {
@@ -524,6 +617,8 @@ impl AppInner {
     ) -> (Retained<NSImage>, (f64, f64)) {
         let w = layout.total_w;
         let h = layout.total_h;
+        // Tag slots (window id -> tag number), copied out of the shared Core.
+        let tags = self.shared.lock().unwrap().tags;
 
         // Build / refresh cached NSImage thumbnails (converted from CGImage).
         let mut ns_ptrs: Vec<Option<*const c_void>> = Vec::with_capacity(items.len());
@@ -678,6 +773,70 @@ impl AppInner {
                     let _: () = msg_send![&sel_path, setLineWidth: 3.0];
                     let _: () = msg_send![&sel_path, stroke];
                 }
+
+                // Tag badge: a numbered amber pill at the thumbnail's top-right
+                // corner. Purely a visual mark — tags never affect ordering,
+                // layout or selection.
+                if let Some(tag_n) = tags.iter().position(|t| *t == Some(item.id)).map(|i| i + 1) {
+                    let bw = 20.0;
+                    let bh = 18.0;
+                    let bx = r.thumb.x + r.thumb.w - bw - 6.0;
+                    let by = r.thumb.y + r.thumb.h - bh - 6.0;
+                    let bpath: Retained<NSBezierPath> = msg_send![
+                        NSBezierPath::class(),
+                        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(bx, by), NSSize::new(bw, bh)),
+                        xRadius: 5.0,
+                        yRadius: 5.0
+                    ];
+                    let bcol = NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.62, 0.05, 0.95);
+                    let _: () = msg_send![&bcol, setFill];
+                    let _: () = msg_send![&bpath, fill];
+                    let num = util::ns_string(&format!("{}", tag_n));
+                    let font = NSFont::boldSystemFontOfSize(12.0);
+                    let wcol = NSColor::whiteColor();
+                    let attrs = dict2(&*font_key(), &*font, &*color_key(), &*wcol);
+                    let at: Retained<NSAttributedString> = msg_send![
+                        NSAttributedString::alloc(),
+                        initWithString: &*num,
+                        attributes: &*attrs
+                    ];
+                    let sz: NSSize = msg_send![&*at, size];
+                    let _: () = msg_send![&*at, drawAtPoint: NSPoint::new(
+                        bx + (bw - sz.width) / 2.0,
+                        by + (bh - sz.height) / 2.0
+                    )];
+                }
+            }
+
+            // Transient hint (tag feedback / first-`p` cue) in the bottom
+            // padding, auto-expired by tick.
+            if let Some((text, until)) = &self.hint {
+                if Instant::now() < *until {
+                    let t = util::ns_string(text);
+                    let font = NSFont::systemFontOfSize(12.0);
+                    let col = NSColor::colorWithCalibratedWhite_alpha(0.95, 0.98);
+                    let attrs = dict2(&*font_key(), &*font, &*color_key(), &*col);
+                    let at: Retained<NSAttributedString> = msg_send![
+                        NSAttributedString::alloc(),
+                        initWithString: &*t,
+                        attributes: &*attrs
+                    ];
+                    let sz: NSSize = msg_send![&*at, size];
+                    let pw = sz.width + 22.0;
+                    let ph = 18.0; // fits inside the 20pt bottom padding
+                    let px = (w - pw) / 2.0;
+                    let py = 2.0;
+                    let pill: Retained<NSBezierPath> = msg_send![
+                        NSBezierPath::class(),
+                        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(px, py), NSSize::new(pw, ph)),
+                        xRadius: 9.0,
+                        yRadius: 9.0
+                    ];
+                    let pcol = NSColor::colorWithCalibratedWhite_alpha(0.0, 0.45);
+                    let _: () = msg_send![&pcol, setFill];
+                    let _: () = msg_send![&pill, fill];
+                    let _: () = msg_send![&*at, drawAtPoint: NSPoint::new(px + 11.0, py + (ph - sz.height) / 2.0)];
+                }
             }
 
             let _: () = msg_send![&*img, unlockFocus];
@@ -750,6 +909,16 @@ impl AppInner {
 
     fn tick(&mut self) {
         let visible = { self.shared.lock().unwrap().visible };
+        // Expire transient hints so they don't linger forever while ⌘ is held
+        // with no further interaction (redraw once to clear the drawn text).
+        if let Some((_, until)) = &self.hint {
+            if Instant::now() >= *until {
+                self.hint = None;
+                if visible {
+                    self.redraw();
+                }
+            }
+        }
         if visible {
             // NOTE: the overlay's visibility is tied to the ⌘ key being held
             // (the event tap hides it on release / explicit actions), so no

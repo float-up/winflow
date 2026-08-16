@@ -43,6 +43,25 @@ pub const HOTKEY_SPACE: Hotkey =
 pub const HOTKEY_APP: Hotkey =
     Hotkey { mods: ffi::KCG_EVENT_FLAG_COMMAND, keycode: ffi::KVK_ANSI_GRAVE };
 
+/// Maximum number of quick-entry tags (`⌘⇧1` / `⌘⇧2` / `⌘⇧3`).
+pub const MAX_TAGS: usize = 3;
+/// Max gap between the two `p` presses that toggles a tag (double-tap).
+pub const DOUBLE_P_MS: u64 = 400;
+
+/// Lowest free tag slot (0-based, = tag number − 1): a slot is free when it
+/// is empty or when its window is no longer alive (per `alive`). Returns
+/// `None` when all slots are taken by live windows. Slots are NEVER
+/// compacted — when a tagged window closes, tags 2/3 don't shift down to
+/// fill the gap; a new tag simply takes the lowest free slot (so after tag 1
+/// closes, the next tag added becomes 1 again).
+pub fn free_tag_slot<F: Fn(u32) -> bool>(tags: &[Option<u32>; MAX_TAGS], alive: F) -> Option<usize> {
+    tags.iter()
+        .position(|t| match t {
+            None => true,
+            Some(id) => !alive(*id),
+        })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Hotkey {
     /// Required modifier mask (KCG_EVENT_FLAG_* bits).
@@ -82,6 +101,11 @@ pub struct Core {
     /// event-tap thread on every flags change; the quick-tap timer uses it so
     /// the overlay is only shown while ⌘ is still down.
     pub cmd_held: bool,
+    /// Quick-entry tags (⌘⇧1/2/3). Index 0..2 = tag numbers 1..3; each slot
+    /// holds the tagged window id or None when free. Never compacted: when a
+    /// tagged window closes its slot stays empty (other tags don't shift),
+    /// and a new tag takes the lowest free slot (see `free_tag_slot`).
+    pub tags: [Option<u32>; MAX_TAGS],
     /// Window ids the capture loop should keep thumbnails for.
     pub tracked: Vec<u32>,
     /// Ask the capture loop to refresh missing/provisional thumbnails now
@@ -118,7 +142,16 @@ impl Core {
             wrap,
             capture_interval_ms: 45_000,
             cmd_held: false,
+            tags: [None, None, None],
         }
+    }
+
+    /// Tag number (1..=MAX_TAGS) bound to `window_id`, if any.
+    pub fn tag_of(&self, window_id: u32) -> Option<usize> {
+        self.tags
+            .iter()
+            .position(|t| *t == Some(window_id))
+            .map(|i| i + 1)
     }
 
     pub fn nav_next(&mut self) {
@@ -162,6 +195,12 @@ pub enum MainCmd {
     QuickSwitch(Mode),
     Hide,
     ThumbUpdated(u32),
+    /// Double-`p` on the selected window: add/remove its tag (quick entry).
+    ToggleTag(u32),
+    /// `⌘⇧1/2/3`: switch straight to the tagged window (arg = tag number).
+    ActivateTag(usize),
+    /// Transient hint text shown in the overlay (tag feedback / cue).
+    TagHint(String),
     OpenPanel,
     PermDialog,
     Tick,
@@ -234,10 +273,13 @@ struct TapCtx {
     shared: Arc<Mutex<Core>>,
     /// Currently held hotkey modifiers (alt|cmd|ctrl|shift).
     mods_down: u64,
+    /// Timestamp of the last `p` keydown while the overlay was visible; a
+    /// second `p` within `DOUBLE_P_MS` toggles a tag on the selected window.
+    last_p_press: Option<std::time::Instant>,
 }
 
 pub fn start_tap(shared: Arc<Mutex<Core>>) {
-    let ctx = Box::into_raw(Box::new(TapCtx { shared, mods_down: 0 }));
+    let ctx = Box::into_raw(Box::new(TapCtx { shared, mods_down: 0, last_p_press: None }));
     let mask = (1u64 << ffi::KCG_EVENT_KEY_DOWN)
         | (1u64 << ffi::KCG_EVENT_KEY_UP)
         | (1u64 << ffi::KCG_EVENT_FLAGS_CHANGED);
@@ -372,6 +414,26 @@ impl TapCtx {
             return true;
         }
 
+        // Tag quick-switch hotkeys ⌘⇧1/2/3: jump straight to a tagged window
+        // from anywhere (overlay open or not). CGEvent flags don't distinguish
+        // left/right Shift, so either shift key works.
+        if mods == (ffi::KCG_EVENT_FLAG_COMMAND | ffi::KCG_EVENT_FLAG_SHIFT)
+            && matches!(keycode, ffi::KVK_ANSI_1 | ffi::KVK_ANSI_2 | ffi::KVK_ANSI_3)
+        {
+            let n = match keycode {
+                ffi::KVK_ANSI_1 => 1,
+                ffi::KVK_ANSI_2 => 2,
+                _ => 3,
+            };
+            // A tag hotkey is an explicit switch request: cancel any pending
+            // quick-tap judgment (armed by a prior ⌘Tab/⌘` press) so neither
+            // the overlay nor a follow-up QuickSwitch fires on ⌘ release.
+            core.quick_pending = false;
+            core.quick_show_dispatched = false;
+            dispatch_main(MainCmd::ActivateTag(n));
+            return true;
+        }
+
         if core.visible {
             let mut changed = false;
             match keycode {
@@ -407,6 +469,27 @@ impl TapCtx {
                 ffi::KVK_ANSI_J | ffi::KVK_DOWN_ARROW => {
                     core.nav_dir(Dir::Down);
                     changed = true;
+                }
+                // Double-`p` toggles a quick-entry tag on the selected window.
+                // First press only arms + shows a hint; the second press
+                // (within DOUBLE_P_MS) dispatches the toggle. Both presses are
+                // swallowed like every other key while the overlay is up.
+                ffi::KVK_ANSI_P => {
+                    let now = std::time::Instant::now();
+                    let is_double = self
+                        .last_p_press
+                        .is_some_and(|t| now.duration_since(t) <= std::time::Duration::from_millis(DOUBLE_P_MS));
+                    if is_double {
+                        self.last_p_press = None;
+                        if let Some(it) = core.items.get(core.selection) {
+                            dispatch_main(MainCmd::ToggleTag(it.id));
+                        }
+                    } else {
+                        self.last_p_press = Some(now);
+                        dispatch_main(MainCmd::TagHint(
+                            format!("再按一次 P 添加/移除标签（⌘⇧1-{} 快速切换）", MAX_TAGS),
+                        ));
+                    }
                 }
                 _ => {}
             }
@@ -464,4 +547,51 @@ pub fn start_tick() {
         std::thread::sleep(std::time::Duration::from_millis(150));
         dispatch_main(MainCmd::Tick);
     });
+}
+
+#[cfg(test)]
+mod tag_tests {
+    use super::*;
+
+    #[test]
+    fn tags_fill_in_order() {
+        // First three adds take slots 1, 2, 3; the 4th is refused.
+        // (`alive` returns true when the tagged window is still alive.)
+        let mut tags = [None, None, None];
+        assert_eq!(free_tag_slot(&tags, |_| true), Some(0));
+        tags[0] = Some(1);
+        assert_eq!(free_tag_slot(&tags, |_| true), Some(1));
+        tags[1] = Some(2);
+        assert_eq!(free_tag_slot(&tags, |_| true), Some(2));
+        tags[2] = Some(3);
+        assert_eq!(free_tag_slot(&tags, |_| true), None);
+    }
+
+    #[test]
+    fn closed_window_frees_lowest_slot_without_compaction() {
+        // Tag 1's window (id 1) closed: slot 0 becomes free even though
+        // slots 1 and 2 still hold live windows — tags 2/3 do NOT shift.
+        let tags = [Some(1), Some(2), Some(3)];
+        assert_eq!(free_tag_slot(&tags, |id| id != 1), Some(0));
+        // Tag 2's window closed instead: lowest free slot is 1.
+        let tags = [Some(1), Some(2), Some(3)];
+        assert_eq!(free_tag_slot(&tags, |id| id != 2), Some(1));
+    }
+
+    #[test]
+    fn all_slots_live_means_full() {
+        let tags = [Some(1), Some(2), Some(3)];
+        assert_eq!(free_tag_slot(&tags, |_| true), None);
+    }
+
+    #[test]
+    fn tag_of_returns_one_based_number() {
+        let mut core = Core::new(true);
+        assert_eq!(core.tag_of(7), None);
+        core.tags[0] = Some(7);
+        core.tags[2] = Some(9);
+        assert_eq!(core.tag_of(7), Some(1));
+        assert_eq!(core.tag_of(9), Some(3));
+        assert_eq!(core.tag_of(42), None);
+    }
 }

@@ -30,6 +30,7 @@ This project is built entirely with Pi + DeepSeek V4, with no Pi plugins or skil
 - **Equal-height, variable-width thumbnails.** Height is fixed and width follows each window's aspect ratio, so a row can fit several windows.
 - **Multiple navigation styles.** Arrow keys / `hjkl` / `Tab` / `Shift+Tab` / scroll wheel, with **edge wrapping**.
 - **Hover to select.** The mouse behaves exactly like the keyboard — hover to select with a highlight box that follows instantly, click to switch.
+- **Window tags (quick entries).** With the overlay open, select a window and **press `P` twice** to tag it — an amber numbered badge appears at the top-right of its thumbnail (purely visual; ordering and layout are untouched). Tags are numbered **1/2/3 in order of addition, up to 3**; press `⌘⇧1` / `⌘⇧2` / `⌘⇧3` (either Shift key works) **anytime to jump straight to that tagged window**. When a tagged window closes, the other tags keep their numbers (no shifting), and the next tag you add takes the lowest free number (e.g. after tag 1's window closes, the next tag becomes 1). Double-`P` on an already tagged window removes its tag; a subtle hint appears when the 3-tag limit is reached.
 - **Junk-window filtering.** Windows that shouldn't be switch targets are filtered out automatically (e.g., Feishu's watermark layer: untitled, fully contained by a larger window of the same app, transparent, or too small).
 
 ## Building and Running
