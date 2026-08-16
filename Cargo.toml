@@ -1,0 +1,26 @@
+[package]
+name = "winflow"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight macOS window switcher with live thumbnails, LRU ordering and hjkl/arrow/mouse navigation."
+
+[dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = [
+    "NSArray", "NSAttributedString", "NSDictionary", "NSGeometry",
+    "NSData", "NSObject", "NSString", "NSURL", "NSValue",
+] }
+objc2-core-graphics = { version = "0.3", features = ["CGImage"] }
+objc2-app-kit = { version = "0.3", features = ["objc2-core-graphics", 
+    "AppKitDefines", "block2",
+    "NSAlert", "NSApplication", "NSBezierPath", "NSColor", "NSEvent", "NSFont",
+    "NSBitmapImageRep", "NSGraphicsContext", "NSImage", "NSImageView", "NSRunningApplication",
+    "NSScreen", "NSView", "NSWindow", "NSWorkspace", "NSButton", "NSTextField",
+] }
+block2 = "0.6"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true

@@ -1,0 +1,467 @@
+//! Shared state (Core) plus the global event-tap / tick / dispatch plumbing.
+//!
+//! Threading model:
+//! - `Core` is behind a Mutex, touched by the event-tap thread, capture threads
+//!   and the main thread. It contains no AppKit objects, so it is Send.
+//! - All UI work (panel, rendering, activation) happens on the main thread.
+//!   Background threads only mutate `Core` and dispatch `MainCmd` to the main
+//!   queue via libdispatch (`dispatch_async_f`).
+
+use crate::ffi;
+use crate::layout::{self, Dir};
+use crate::util;
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Mode {
+    /// Every active window on the current Space (one entry per window).
+    Space,
+    /// Subset of Space: all windows of the frontmost app.
+    App,
+}
+
+#[derive(Clone, Debug)]
+pub struct Item {
+    pub id: u32,
+    pub pid: i32,
+    pub owner: String,
+    pub title: String,
+    /// width/height, clamped to a sane range for layout.
+    pub aspect: f64,
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Fixed hotkeys — they deliberately override the system shortcuts:
+/// `⌘Tab` (space switcher) and `⌘\`` (current-app switcher). The HID-level
+/// event tap swallows the keydowns so the system switcher never appears.
+pub const HOTKEY_SPACE: Hotkey =
+    Hotkey { mods: ffi::KCG_EVENT_FLAG_COMMAND, keycode: ffi::KVK_TAB };
+pub const HOTKEY_APP: Hotkey =
+    Hotkey { mods: ffi::KCG_EVENT_FLAG_COMMAND, keycode: ffi::KVK_ANSI_GRAVE };
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Hotkey {
+    /// Required modifier mask (KCG_EVENT_FLAG_* bits).
+    pub mods: u64,
+    /// Keycode (HIToolbox virtual keycode).
+    pub keycode: u16,
+}
+
+pub struct Core {
+    pub visible: bool,
+    pub mode: Mode,
+    pub selection: usize,
+    pub hover: Option<usize>,
+    pub items: Vec<Item>,
+    pub layout: Option<layout::Layout>,
+    /// MRU for the active mode; front = most recently activated window.
+    pub mru: VecDeque<u32>,
+    pub mru_space: VecDeque<u32>,
+    pub mru_app: VecDeque<u32>,
+    /// Globally active window id (synced from the frontmost window on show,
+    /// updated on every activation).
+    pub active: Option<u32>,
+    /// The window we are switching FROM (the "previous" half of the quick
+    /// switch toggle; also used as the first/selected item when the overlay
+    /// opens).
+    pub prev: Option<u32>,
+    /// Quick-tap state: hotkey pressed, overlay not shown yet.
+    pub quick_pending: bool,
+    /// Show already dispatched (overlay is loading); used to keep repeated
+    /// hotkey presses from re-arming the quick window while it loads.
+    pub quick_show_dispatched: bool,
+    pub quick_deadline: std::time::Instant,
+    pub quick_mode: Mode,
+    /// Quick-tap judgment delay (ms), runtime-adjustable.
+    pub quick_delay_ms: u64,
+    /// Whether the hotkey modifier (⌘) is currently held. Written by the
+    /// event-tap thread on every flags change; the quick-tap timer uses it so
+    /// the overlay is only shown while ⌘ is still down.
+    pub cmd_held: bool,
+    /// Window ids the capture loop should keep thumbnails for.
+    pub tracked: Vec<u32>,
+    /// Ask the capture loop to refresh missing/provisional thumbnails now
+    /// (startup warm-up / overlay opened / desktop change). Stale thumbnails
+    /// are refreshed only by the periodic `capture_interval` pass, so a wake
+    /// never re-captures an already-cached image.
+    pub refresh_all: bool,
+    pub wrap: bool,
+    /// Thumbnail capture interval in milliseconds (runtime-adjustable).
+    pub capture_interval_ms: u64,
+}
+
+impl Core {
+    pub fn new(wrap: bool) -> Self {
+        Core {
+            visible: false,
+            mode: Mode::Space,
+            selection: 0,
+            hover: None,
+            items: Vec::new(),
+            layout: None,
+            mru: VecDeque::new(),
+            mru_space: VecDeque::new(),
+            mru_app: VecDeque::new(),
+            active: None,
+            prev: None,
+            quick_pending: false,
+            quick_show_dispatched: false,
+            quick_deadline: std::time::Instant::now(),
+            quick_mode: Mode::Space,
+            quick_delay_ms: 80,
+            tracked: Vec::new(),
+            refresh_all: false,
+            wrap,
+            capture_interval_ms: 45_000,
+            cmd_held: false,
+        }
+    }
+
+    pub fn nav_next(&mut self) {
+        if self.items.is_empty() {
+            self.selection = 0;
+            return;
+        }
+        self.selection = (self.selection + 1) % self.items.len();
+    }
+
+    pub fn nav_prev(&mut self) {
+        if self.items.is_empty() {
+            self.selection = 0;
+            return;
+        }
+        self.selection = (self.selection + self.items.len() - 1) % self.items.len();
+    }
+
+    pub fn nav_dir(&mut self, dir: Dir) {
+        if self.items.is_empty() {
+            return;
+        }
+        if let Some(l) = &self.layout {
+            self.selection = l.nav(self.selection, dir, self.wrap);
+        } else {
+            match dir {
+                Dir::Next => self.nav_next(),
+                Dir::Prev => self.nav_prev(),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Commands dispatched to the main thread.
+pub enum MainCmd {
+    Show(Mode),
+    Redraw,
+    Activate(usize),
+    /// Quick-tap: switch straight to the previous window without the overlay.
+    QuickSwitch(Mode),
+    Hide,
+    ThumbUpdated(u32),
+    OpenPanel,
+    PermDialog,
+    Tick,
+    Quit,
+}
+
+// ---------- main-thread command delivery ----------
+//
+// Background threads push `MainCmd` into a mutex queue. A CFRunLoopTimer
+// installed on the main run loop drains it every 100ms on the main thread.
+// (A CFRunLoopSource was tried first, but on macOS 26 a version-0 source
+// created via FFI spuriously fired at `CFRunLoopAddSource`; the timer is
+// deterministic and costs ~nothing when the queue is empty.)
+
+static CMD_QUEUE: std::sync::OnceLock<Mutex<Vec<MainCmd>>> = std::sync::OnceLock::new();
+
+/// Must be called on the main thread before background threads start.
+pub fn init_cmd_timer() {
+    let ctx = ffi::CFRunLoopTimerContext {
+        version: 0,
+        info: std::ptr::null_mut(),
+        retain: None,
+        release: None,
+        copy_description: None,
+    };
+    let timer = unsafe {
+        ffi::CFRunLoopTimerCreate(
+            std::ptr::null(),
+            0.02, // fire soon after startup
+            0.1,  // then every 100ms
+            0,
+            0,
+            Some(process_cmds),
+            &ctx,
+        )
+    };
+    unsafe {
+        ffi::CFRunLoopAddTimer(ffi::CFRunLoopGetMain(), timer, ffi::kCFRunLoopCommonModes);
+    }
+}
+
+pub fn dispatch_main(cmd: MainCmd) {
+    let q = CMD_QUEUE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut q = q.lock().unwrap();
+    q.push(cmd);
+}
+
+unsafe extern "C" fn process_cmds(_timer: ffi::CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
+    // FFI callbacks must not unwind: catch panics (e.g. msg_send selector
+    // validation) so a bug never aborts the whole process.
+    let r = std::panic::catch_unwind(|| {
+        let cmds = {
+            let q = CMD_QUEUE.get_or_init(|| Mutex::new(Vec::new()));
+            let mut q = q.lock().unwrap();
+            std::mem::take(&mut *q)
+        };
+        for cmd in cmds {
+            crate::overlay::handle_cmd(cmd);
+        }
+    });
+    if let Err(e) = r {
+        let msg = if let Some(s) = e.downcast_ref::<&str>() { (*s).to_string() } else if let Some(s) = e.downcast_ref::<String>() { s.clone() } else { "unknown panic".to_string() };
+        crate::util::log(&format!("main-thread command panicked: {}", msg));
+    }
+}
+
+// ---------- event tap ----------
+
+struct TapCtx {
+    shared: Arc<Mutex<Core>>,
+    /// Currently held hotkey modifiers (alt|cmd|ctrl|shift).
+    mods_down: u64,
+}
+
+pub fn start_tap(shared: Arc<Mutex<Core>>) {
+    let ctx = Box::into_raw(Box::new(TapCtx { shared, mods_down: 0 }));
+    let mask = (1u64 << ffi::KCG_EVENT_KEY_DOWN)
+        | (1u64 << ffi::KCG_EVENT_KEY_UP)
+        | (1u64 << ffi::KCG_EVENT_FLAGS_CHANGED);
+    let port = unsafe {
+        ffi::CGEventTapCreate(
+            ffi::KCG_HID_EVENT_TAP,
+            ffi::KCG_HEAD_INSERT_EVENT_TAP,
+            ffi::KCG_EVENT_TAP_OPTION_DEFAULT,
+            mask,
+            tap_callback,
+            ctx as *mut std::ffi::c_void,
+        )
+    };
+    if port.is_null() {
+        util::log("event tap could not be created (accessibility permission?)");
+        return;
+    }
+    let source = unsafe { ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
+    let common = ffi::RawPtr(unsafe { ffi::kCFRunLoopCommonModes });
+    let port = ffi::RawPtr(port as *const std::ffi::c_void);
+    let source = ffi::RawPtr(source as *const std::ffi::c_void);
+    std::thread::spawn(move || unsafe {
+        ffi::CFRunLoopAddSource(
+            ffi::CFRunLoopGetCurrent(),
+            source.get() as ffi::CFRunLoopSourceRef,
+            common.get(),
+        );
+        ffi::CGEventTapEnable(port.get() as ffi::CFMachPortRef, true);
+        ffi::CFRunLoopRun();
+    });
+}
+
+unsafe extern "C" fn tap_callback(
+    _proxy: ffi::CGEventTapProxy,
+    event_type: ffi::CGEventType,
+    event: ffi::CGEventRef,
+    refcon: *mut std::ffi::c_void,
+) -> ffi::CGEventRef {
+    let ctx = &mut *(refcon as *mut TapCtx);
+    let keycode = ffi::CGEventGetIntegerValueField(event, ffi::KCG_KEYBOARD_EVENT_KEYCODE) as u16;
+    let flags = ffi::CGEventGetFlags(event);
+    let swallow = ctx.handle(event_type, keycode, flags);
+    if swallow {
+        std::ptr::null_mut()
+    } else {
+        event
+    }
+}
+
+const MOD_MASK: u64 = ffi::KCG_EVENT_FLAG_ALTERNATE
+    | ffi::KCG_EVENT_FLAG_COMMAND
+    | ffi::KCG_EVENT_FLAG_CONTROL
+    | ffi::KCG_EVENT_FLAG_SHIFT;
+
+impl TapCtx {
+    fn handle(&mut self, event_type: u32, keycode: u16, flags: u64) -> bool {
+        match event_type {
+            ffi::KCG_EVENT_FLAGS_CHANGED => {
+                let now = flags & MOD_MASK;
+                // Both hotkeys use ⌘ as their only modifier, so a plain ⌘
+                // held/released check is enough to drive show/hide/quick-switch.
+                let cmd = ffi::KCG_EVENT_FLAG_COMMAND;
+                let prev_had = (self.mods_down & cmd) == cmd;
+                let now_had = (now & cmd) == cmd;
+                self.mods_down = now;
+                let mut core = self.shared.lock().unwrap();
+                // The overlay's visibility tracks the hotkey modifier (⌘): it
+                // is shown only while ⌘ is held, and released on ⌘ release.
+                core.cmd_held = now & ffi::KCG_EVENT_FLAG_COMMAND != 0;
+                if prev_had && !now_had {
+                    if core.quick_pending {
+                        // Released with the overlay not yet visible: always
+                        // toggle straight to the previous window. This covers
+                        // both a true quick tap AND a slightly slow tap (or a
+                        // release right as the overlay is still loading) —
+                        // without it, taps near the threshold occasionally did
+                        // nothing because the overlay had not shown yet.
+                        core.quick_pending = false;
+                        dispatch_main(MainCmd::QuickSwitch(core.quick_mode));
+                    } else if core.visible {
+                        // Releasing ⌘ switches to the window the selection box
+                        // is on (no explicit Enter/click needed) and closes the
+                        // overlay — the classic hold-to-preview, release-to-switch.
+                        let sel = core.selection;
+                        dispatch_main(MainCmd::Activate(sel));
+                    } else {
+                        // Overlay not visible: cancel any Show still in the
+                        // command queue (e.g. ⌘⇧Tab released within ~100ms).
+                        dispatch_main(MainCmd::Hide);
+                    }
+                }
+                false // never swallow modifier up/down
+            }
+            ffi::KCG_EVENT_KEY_DOWN => self.on_key_down(keycode, flags),
+            _ => false,
+        }
+    }
+
+    fn on_key_down(&mut self, keycode: u16, flags: u64) -> bool {
+        let mods = flags & MOD_MASK;
+        let h1 = HOTKEY_SPACE;
+        let h2 = HOTKEY_APP;
+        let mut core = self.shared.lock().unwrap();
+
+        // ⌘Shift+Tab: open the space switcher backwards like the system.
+        if !core.visible
+            && keycode == ffi::KVK_TAB
+            && mods == (ffi::KCG_EVENT_FLAG_COMMAND | ffi::KCG_EVENT_FLAG_SHIFT)
+        {
+            dispatch_main(MainCmd::Show(Mode::Space));
+            return true;
+        }
+
+        // Mode-1 hotkey (⌘Tab): opens space switcher; repeats cycle.
+        if mods == h1.mods && keycode == h1.keycode {
+            if core.visible && core.mode == Mode::Space {
+                core.nav_next();
+                dispatch_main(MainCmd::Redraw);
+            } else {
+                arm_quick(&mut core, Mode::Space);
+            }
+            return true;
+        }
+        // Mode-2 hotkey (⌘`): opens app-window switcher.
+        if mods == h2.mods && keycode == h2.keycode {
+            if core.visible && core.mode == Mode::App {
+                core.nav_next();
+                dispatch_main(MainCmd::Redraw);
+            } else {
+                arm_quick(&mut core, Mode::App);
+            }
+            return true;
+        }
+
+        if core.visible {
+            let mut changed = false;
+            match keycode {
+                ffi::KVK_TAB => {
+                    if mods & ffi::KCG_EVENT_FLAG_SHIFT != 0 {
+                        core.nav_prev();
+                    } else {
+                        core.nav_next();
+                    }
+                    changed = true;
+                }
+                ffi::KVK_ESCAPE => {
+                    dispatch_main(MainCmd::Hide);
+                    return true;
+                }
+                ffi::KVK_RETURN => {
+                    let sel = core.selection;
+                    dispatch_main(MainCmd::Activate(sel));
+                    return true;
+                }
+                ffi::KVK_ANSI_H | ffi::KVK_LEFT_ARROW => {
+                    core.nav_dir(Dir::Left);
+                    changed = true;
+                }
+                ffi::KVK_ANSI_L | ffi::KVK_RIGHT_ARROW => {
+                    core.nav_dir(Dir::Right);
+                    changed = true;
+                }
+                ffi::KVK_ANSI_K | ffi::KVK_UP_ARROW => {
+                    core.nav_dir(Dir::Up);
+                    changed = true;
+                }
+                ffi::KVK_ANSI_J | ffi::KVK_DOWN_ARROW => {
+                    core.nav_dir(Dir::Down);
+                    changed = true;
+                }
+                _ => {}
+            }
+            if changed {
+                dispatch_main(MainCmd::Redraw);
+            }
+            // Swallow every key while the overlay is up so it never reaches
+            // the application underneath.
+            return true;
+        }
+
+        false
+    }
+}
+
+/// Arm the quick-tap judgment window: the overlay is NOT shown immediately;
+/// a timer thread shows it after `quick_delay_ms` if the hotkey modifier is
+/// still held, and a fast release instead triggers `QuickSwitch`.
+fn arm_quick(core: &mut Core, mode: Mode) {
+    if core.quick_pending && core.quick_mode == mode {
+        return; // repeated ⌘Tab keydowns must not extend the deadline
+    }
+    if core.quick_show_dispatched {
+        return; // overlay is already loading; do not re-arm
+    }
+    core.quick_pending = true;
+    core.quick_mode = mode;
+    core.quick_deadline = std::time::Instant::now() + std::time::Duration::from_millis(core.quick_delay_ms);
+}
+
+/// Background poller (one thread) that shows the switcher once the quick-tap
+/// delay elapses while the hotkey modifier (⌘) is still held.
+pub fn start_quick_timer(shared: Arc<Mutex<Core>>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut core = shared.lock().unwrap();
+        if core.quick_pending
+            && !core.quick_show_dispatched
+            && core.cmd_held
+            && std::time::Instant::now() >= core.quick_deadline
+        {
+            core.quick_show_dispatched = true;
+            let mode = core.quick_mode;
+            // `quick_pending` stays set until Show() actually processes, so
+            // repeated ⌘Tab keydowns while the overlay loads do not re-arm.
+            dispatch_main(MainCmd::Show(mode));
+        }
+    });
+}
+
+// ---------- periodic tick ----------
+
+pub fn start_tick() {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        dispatch_main(MainCmd::Tick);
+    });
+}
