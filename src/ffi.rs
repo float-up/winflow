@@ -348,6 +348,17 @@ pub unsafe fn cg_window_list() -> CFArrayRef {
     )
 }
 
+/// ALL windows managed by the window server (no on-screen filter): includes
+/// minimized windows and windows on other Spaces. Used for tag-slot liveness
+/// — a tagged window parked on another Space is still alive and keeps its
+/// slot; a closed window disappears from this list and frees its slot.
+pub unsafe fn cg_window_list_all() -> CFArrayRef {
+    CGWindowListCopyWindowInfo(
+        KCG_WINDOW_LIST_OPTION_EXCLUDE_DESKTOP_ELEMENTS,
+        KCG_NULL_WINDOW_ID,
+    )
+}
+
 pub unsafe fn active_space() -> Option<i64> {
     let s = CGSGetActiveSpace(CGSMainConnectionID());
     if s > 0 {

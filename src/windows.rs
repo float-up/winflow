@@ -8,7 +8,7 @@ use crate::util;
 use objc2::rc::Retained;
 use objc2::{msg_send, ClassType};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Debug)]
 pub struct Win {
@@ -227,6 +227,33 @@ pub fn display_window_ids(display: (f64, f64, f64, f64)) -> Vec<u32> {
         .map(|w| w.id)
         .collect();
     ids.sort_unstable();
+    ids
+}
+
+/// All window ids currently managed by the window server, INCLUDING minimized
+/// windows and windows on other Spaces (no on-screen filter). Used to decide
+/// whether a tag slot is free after its window closed: a window that merely
+/// lives on another Space is still alive and keeps its slot; a closed window
+/// disappears from the window server and frees the slot for reuse.
+pub fn window_ids_all() -> HashSet<u32> {
+    let arr = unsafe { ffi::cg_window_list_all() };
+    if arr.is_null() {
+        return HashSet::new();
+    }
+    let n = unsafe { ffi::cf_array_count(arr) };
+    let mut ids = HashSet::with_capacity(n);
+    for i in 0..n {
+        let d = unsafe { ffi::cf_array_get(arr, i) };
+        if d.is_null() {
+            continue;
+        }
+        if let Some(id) = unsafe {
+            ffi::cf_dict_num_i32(d as ffi::CFDictionaryRef, ffi::kCGWindowNumber)
+        } {
+            ids.insert(id as u32);
+        }
+    }
+    unsafe { ffi::cf_release(arr) };
     ids
 }
 
