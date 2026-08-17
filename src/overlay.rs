@@ -595,15 +595,22 @@ impl AppInner {
             let _: () = msg_send![&*iv, setImage: &*img];
             let win = &*(self.panel as *const NSWindow);
             let cur: NSRect = msg_send![&*win, frame];
-            if (cur.size.width - w).abs() > 0.5 || (cur.size.height - h).abs() > 0.5 {
-                let (fx, fy, fw, fh) = self.target_screen_frame();
-                let x = fx + (fw - w) / 2.0;
-                let y = fy + (fh - h) / 2.0;
-                let _: () = msg_send![
-                    &*win,
-                    setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h)),
-                    display: true
-                ];
+            let (fx, fy, fw, fh) = self.target_screen_frame();
+            let x = fx + (fw - w) / 2.0;
+            let y = fy + (fh - h) / 2.0;
+            let want = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+            // Recenter whenever the size OR the on-screen position no longer
+            // matches the target display. The size-only check let the panel
+            // stay on the display of a previous show whenever two shows
+            // produced the same layout size (equal-width displays + same row
+            // count), so the overlay appeared on the startup desktop no
+            // matter where the cursor was. (The panel is not user-draggable,
+            // so recentering on every mismatch is always safe.)
+            let size_changed =
+                (cur.size.width - w).abs() > 0.5 || (cur.size.height - h).abs() > 0.5;
+            let pos_changed = (cur.origin.x - x).abs() > 0.5 || (cur.origin.y - y).abs() > 0.5;
+            if size_changed || pos_changed {
+                let _: () = msg_send![&*win, setFrame: want, display: true];
             }
         }
     }
