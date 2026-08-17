@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-15
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests
+        run: cargo test --all-targets
+
+      - name: Build macOS app
+        run: ./package.sh
+
+      - name: Archive app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent \
+            dist/winflow.app \
+            "dist/winflow-${GITHUB_REF_NAME}.zip"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: dist/winflow-${{ github.ref_name }}.zip
