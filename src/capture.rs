@@ -78,9 +78,12 @@ pub fn start(
             // A first frame can be partially drawn while a window is still
             // settling (launch/restore animation). Any unconfirmed thumbnail
             // that has had `SETTLE` to settle needs a confirm re-capture.
+            // Hold the thumbnail read lock once for both the provisional scan
+            // and the job-list build below (was: one lock per tracked id).
+            let thumbs_r = thumbs.read().unwrap();
             let provisional_due = core.tracked.iter().any(|id| {
-                let t = thumbs.read().unwrap();
-                t.get(id)
+                thumbs_r
+                    .get(id)
                     .is_some_and(|th| !th.confirmed && th.at.elapsed() >= SETTLE)
             });
             let capture = refresh_all || stale_due || provisional_due;
@@ -103,8 +106,7 @@ pub fn start(
                 }
                 let mut jobs: Vec<Job> = Vec::new();
                 for id in core.tracked.iter() {
-                    let t = thumbs.read().unwrap();
-                    match t.get(id) {
+                    match thumbs_r.get(id) {
                         None => jobs.push(Job { id: *id }),
                         Some(th) => {
                             let provisional = !th.confirmed && th.at.elapsed() >= SETTLE;

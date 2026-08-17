@@ -53,6 +53,9 @@ pub struct AppInner {
     /// Frontmost window id on the overlay's display (CG order, before the MRU
     /// reorder), used to sync `active` for multi-window apps like VSCode.
     front_window: Option<u32>,
+    /// Last `windows::collect` result, reused by `quick_switch` for rapid A↔B
+    /// toggling on the same display/mode.
+    collect_cache: Option<CollectCache>,
     initialized: bool,
     warned_screen: bool,
     warned_ax: bool,
@@ -64,6 +67,8 @@ pub struct AppInner {
     thumb_dirty: bool,
     /// Last thumbnail-cache GC time.
     last_gc: Instant,
+    /// Last desktop-change fingerprint of the overlay's display.
+    last_fingerprint: Instant,
     /// Display the overlay is scoped to (CGDirectDisplayID of the display
     /// where the hotkey was pressed; 0 = not yet resolved).
     display_id: u32,
@@ -75,6 +80,14 @@ pub struct AppInner {
 }
 
 unsafe impl Send for AppInner {}
+
+/// Cached result of a `windows::collect` call (see `COLLECT_CACHE_TTL`).
+struct CollectCache {
+    mode: Mode,
+    display_id: u32,
+    items: Vec<Item>,
+    at: Instant,
+}
 
 static APP: OnceLock<Mutex<AppInner>> = OnceLock::new();
 
@@ -93,8 +106,18 @@ static QUICK_DELAY_MS: std::sync::atomic::AtomicU64 =
 /// a no-op.
 const ACTIVATE_GRACE: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// How long a cached quick-switch window list stays reusable. Rapid A↔B
+/// toggling re-collects (CGWindowList + sanitize) on every tap otherwise; within
+/// this window the list is reused and only the cheap frontmost-app query runs.
+const COLLECT_CACHE_TTL: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// How long tag feedback / hint text stays visible in the overlay.
 const HINT_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// How often to re-fingerprint the overlay display's visible windows to detect
+/// a desktop change while the overlay is up. The old per-tick (150ms) check
+/// re-enumerated + string-parsed the whole CG window list on every tick.
+const FINGERPRINT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
 pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbCache>>) {
     {
@@ -123,6 +146,7 @@ pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbC
         thumb_ns: HashMap::new(),
         prev_app_pid: None,
         front_window: None,
+        collect_cache: None,
         initialized: false,
         warned_screen: false,
         warned_ax: false,
@@ -131,6 +155,7 @@ pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbC
         last_activate: None,
         thumb_dirty: false,
         last_gc: Instant::now(),
+        last_fingerprint: Instant::now(),
         display_id: 0,
         last_window_ids: Vec::new(),
         hint: None,
@@ -234,6 +259,9 @@ impl AppInner {
         self.warn_permissions();
         // A fresh overlay starts without a stale hint from a previous session.
         self.hint = None;
+        // The overlay re-collects the window set below; drop any stale
+        // quick-switch cache so a later quick tap re-enumerates fresh.
+        self.collect_cache = None;
         // Re-detect the display under the cursor: the overlay opens on the
         // display where the hotkey was pressed, scoped to that display's
         // current desktop.
@@ -428,8 +456,25 @@ impl AppInner {
     /// external switch).
     fn quick_switch(&mut self, mode: Mode) {
         let display = unsafe { ffi::cursor_display() };
-        let dbounds = unsafe { ffi::display_bounds(display) };
-        let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref());
+        // Reuse a recent collect for the same display/mode so a rapid A↔B
+        // toggle doesn't re-enumerate + sanitize the full CG window list on
+        // every tap. Stale caches fall back to a fresh collect.
+        let cache_hit = self.collect_cache.as_ref().is_some_and(|c| {
+            c.mode == mode && c.display_id == display && c.at.elapsed() < COLLECT_CACHE_TTL
+        });
+        let items = if cache_hit {
+            self.collect_cache.as_ref().unwrap().items.clone()
+        } else {
+            let dbounds = unsafe { ffi::display_bounds(display) };
+            let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref());
+            self.collect_cache = Some(CollectCache {
+                mode,
+                display_id: display,
+                items: items.clone(),
+                at: Instant::now(),
+            });
+            items
+        };
         if items.is_empty() {
             util::log("quick switch: no windows");
             return;
@@ -628,12 +673,12 @@ impl AppInner {
         let tags = self.shared.lock().unwrap().tags;
 
         // Build / refresh cached NSImage thumbnails (converted from CGImage).
+        // Hold the thumbnail read lock once for the whole loop instead of
+        // acquiring/releasing it per item (N items = 1 lock, not N).
         let mut ns_ptrs: Vec<Option<*const c_void>> = Vec::with_capacity(items.len());
+        let thumbs = self.thumbs.read().unwrap();
         for it in items {
-            let info = {
-                let t = self.thumbs.read().unwrap();
-                t.get(&it.id).map(|th| (th.gen, th.image))
-            };
+            let info = thumbs.get(&it.id).map(|th| (th.gen, th.image));
             match info {
                 Some((gen, cg)) => {
                     let need = match self.thumb_ns.get(&it.id) {
@@ -933,8 +978,11 @@ impl AppInner {
 
             // Desktop changed on the overlay's display: refresh the window
             // set. (Per-display space SPI is unavailable on modern macOS, so
-            // we fingerprint the display's visible windows instead.)
-            if self.display_id != 0 {
+            // we fingerprint the display's visible windows instead.) Throttled
+            // to FINGERPRINT_INTERVAL — a desktop switch doesn't need per-tick
+            // (150ms) re-enumeration of the full window list.
+            if self.display_id != 0 && self.last_fingerprint.elapsed() >= FINGERPRINT_INTERVAL {
+                self.last_fingerprint = Instant::now();
                 if let Some(b) = unsafe { ffi::display_bounds(self.display_id) } {
                     let ids = windows::display_window_ids(b);
                     if ids != self.last_window_ids {
@@ -1224,12 +1272,20 @@ fn build_ns_image(cg: ffi::CGImageRef) -> Retained<NSImage> {
     }
 }
 
-fn font_key() -> Retained<NSString> {
-    util::ns_string("NSFont")
+fn font_key() -> &'static NSString {
+    static KEY: OnceLock<ffi::RawPtr> = OnceLock::new();
+    let p = KEY.get_or_init(|| {
+        ffi::RawPtr(Retained::into_raw(util::ns_string("NSFont")) as *const c_void)
+    });
+    unsafe { &*(p.get() as *const NSString) }
 }
 
-fn color_key() -> Retained<NSString> {
-    util::ns_string("NSColor")
+fn color_key() -> &'static NSString {
+    static KEY: OnceLock<ffi::RawPtr> = OnceLock::new();
+    let p = KEY.get_or_init(|| {
+        ffi::RawPtr(Retained::into_raw(util::ns_string("NSColor")) as *const c_void)
+    });
+    unsafe { &*(p.get() as *const NSString) }
 }
 
 /// NSDictionary with two object/key pairs.
@@ -1319,17 +1375,15 @@ fn tail_chars(s: &str, n: usize) -> String {
     s.chars().skip(s.chars().count().saturating_sub(n)).collect()
 }
 
-/// Rendered width of `s` with the given font/color.
+/// Rendered width of `s` with the given font/color (measured directly via
+/// NSString `sizeWithAttributes:`, avoiding an NSAttributedString allocation
+/// on every measurement — `fit_label` measures repeatedly during its binary
+/// search).
 fn text_width(s: &str, font: &NSFont, color: &NSColor) -> f64 {
     unsafe {
         let ns = util::ns_string(s);
         let attrs = dict2(&*font_key(), font, &*color_key(), color);
-        let at: Retained<NSAttributedString> = msg_send![
-            NSAttributedString::alloc(),
-            initWithString: &*ns,
-            attributes: &*attrs
-        ];
-        let sz: NSSize = msg_send![&*at, size];
+        let sz: NSSize = msg_send![&*ns, sizeWithAttributes: &*attrs];
         sz.width
     }
 }
@@ -1360,7 +1414,7 @@ mod order_tests {
     use std::collections::VecDeque;
 
     fn item(id: u32) -> Item {
-        Item { id, pid: 1, owner: "o".into(), title: "t".into(), aspect: 1.0, x: 0.0, y: 0.0, w: 100.0, h: 100.0 }
+        Item { id, pid: 1, owner: "o".into(), title: "t".into(), aspect: 1.0, x: 0.0, y: 0.0, w: 100.0, h: 100.0, n_same_pid: 1 }
     }
 
     fn ids(items: &[Item]) -> Vec<u32> {
