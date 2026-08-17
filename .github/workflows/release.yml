@@ -67,9 +67,22 @@ jobs:
             dist/winflow.app \
             "dist/winflow-${GITHUB_REF_NAME}.zip"
 
+      - name: Find release notes
+        id: release_notes
+        if: steps.release_gate.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          notes_path=".github/release-notes/${GITHUB_REF_NAME}.md"
+          if [ -f "$notes_path" ]; then
+            echo "body_path=$notes_path" >> "$GITHUB_OUTPUT"
+          else
+            echo "body_path=" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Publish GitHub Release
         if: steps.release_gate.outputs.should_release == 'true'
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          body_path: ${{ steps.release_notes.outputs.body_path }}
           files: dist/winflow-${{ github.ref_name }}.zip
