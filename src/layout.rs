@@ -217,7 +217,7 @@ mod tests {
     use crate::state::Item;
 
     fn item(id: u32, aspect: f64) -> Item {
-        Item { id, pid: 1, owner: "t".into(), title: "t".into(), aspect, x: 0.0, y: 0.0, w: aspect * 100.0, h: 100.0 }
+        Item { id, pid: 1, owner: "t".into(), title: "t".into(), aspect, x: 0.0, y: 0.0, w: aspect * 100.0, h: 100.0, n_same_pid: 1 }
     }
 
     #[test]

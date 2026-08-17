@@ -33,6 +33,9 @@ pub struct Item {
     pub y: f64,
     pub w: f64,
     pub h: f64,
+    /// Number of windows of the same app in the current (display-scoped) list.
+    /// `1` lets `activate_item` skip the AX raise/focus round trips entirely.
+    pub n_same_pid: usize,
 }
 
 /// Fixed hotkeys — they deliberately override the system shortcuts:
@@ -188,7 +191,12 @@ impl Core {
 
 /// Commands dispatched to the main thread.
 pub enum MainCmd {
-    Show(Mode),
+    /// Show the overlay for `mode`. The bool is `require_cmd_held`: when true
+    /// (hotkey paths) a ⌘ release during the async collect aborts the show.
+    Show(Mode, bool),
+    /// A background window-collect finished; carry its result back to the main
+    /// thread to finish showing the overlay (see `overlay::finish_show`).
+    ShowReady(ShowData),
     Redraw,
     Activate(usize),
     /// Quick-tap: switch straight to the previous window without the overlay.
@@ -207,15 +215,33 @@ pub enum MainCmd {
     Quit,
 }
 
+/// Result of a background `windows::collect` for the overlay show path.
+pub struct ShowData {
+    pub mode: Mode,
+    pub display_id: u32,
+    pub items: Vec<Item>,
+    pub front_window: Option<u32>,
+    pub last_window_ids: Vec<u32>,
+    /// Whether showing requires ⌘ to still be held (false for the `--show` dev
+    /// aid). When true, a release during the async collect aborts the show.
+    pub require_cmd_held: bool,
+}
+
 // ---------- main-thread command delivery ----------
 //
 // Background threads push `MainCmd` into a mutex queue. A CFRunLoopTimer
-// installed on the main run loop drains it every 100ms on the main thread.
+// installed on the main run loop drains it; `dispatch_main` re-arms that timer
+// to fire immediately (and wakes the run loop) so commands are processed with
+// ~0 latency instead of waiting for the next periodic fire. The 100ms interval
+// is only a backstop, so there are no extra idle wakeups.
 // (A CFRunLoopSource was tried first, but on macOS 26 a version-0 source
 // created via FFI spuriously fired at `CFRunLoopAddSource`; the timer is
 // deterministic and costs ~nothing when the queue is empty.)
 
 static CMD_QUEUE: std::sync::OnceLock<Mutex<Vec<MainCmd>>> = std::sync::OnceLock::new();
+/// The main-thread drain timer, kept so `dispatch_main` can re-arm it to fire
+/// immediately from background threads (see `dispatch_main`).
+static CMD_TIMER: std::sync::OnceLock<ffi::RawPtr> = std::sync::OnceLock::new();
 
 /// Must be called on the main thread before background threads start.
 pub fn init_cmd_timer() {
@@ -230,22 +256,40 @@ pub fn init_cmd_timer() {
         ffi::CFRunLoopTimerCreate(
             std::ptr::null(),
             0.02, // fire soon after startup
-            0.1,  // then every 100ms
+            0.1,  // backstop interval: `dispatch_main` re-arms the timer to fire
+                  // immediately on every push, so this only catches a missed
+                  // wake; keeping it at 100ms means no extra idle wakeups.
             0,
             0,
             Some(process_cmds),
             &ctx,
         )
     };
+    let _ = CMD_TIMER.set(ffi::RawPtr(timer));
     unsafe {
         ffi::CFRunLoopAddTimer(ffi::CFRunLoopGetMain(), timer, ffi::kCFRunLoopCommonModes);
     }
 }
 
 pub fn dispatch_main(cmd: MainCmd) {
-    let q = CMD_QUEUE.get_or_init(|| Mutex::new(Vec::new()));
-    let mut q = q.lock().unwrap();
-    q.push(cmd);
+    {
+        let q = CMD_QUEUE.get_or_init(|| Mutex::new(Vec::new()));
+        let mut q = q.lock().unwrap_or_else(|e| e.into_inner());
+        q.push(cmd);
+    }
+    // Re-arm the drain timer to fire NOW and wake the main run loop, so
+    // hotkey/activate/redraw commands are processed with ~0 latency instead of
+    // waiting for the next scheduled 100ms fire. Both CF functions are
+    // thread-safe; the timer only wakes when a command is actually queued.
+    if let Some(t) = CMD_TIMER.get() {
+        unsafe {
+            ffi::CFRunLoopTimerSetNextFireDate(
+                t.get() as ffi::CFRunLoopTimerRef,
+                ffi::CFAbsoluteTimeGetCurrent(),
+            );
+            ffi::CFRunLoopWakeUp(ffi::CFRunLoopGetMain());
+        }
+    }
 }
 
 unsafe extern "C" fn process_cmds(_timer: ffi::CFRunLoopTimerRef, _info: *mut std::ffi::c_void) {
@@ -321,7 +365,24 @@ unsafe extern "C" fn tap_callback(
     let ctx = &mut *(refcon as *mut TapCtx);
     let keycode = ffi::CGEventGetIntegerValueField(event, ffi::KCG_KEYBOARD_EVENT_KEYCODE) as u16;
     let flags = ffi::CGEventGetFlags(event);
-    let swallow = ctx.handle(event_type, keycode, flags);
+    // FFI callbacks must not unwind: a panic (e.g. a poisoned Core mutex or a
+    // handler bug) would otherwise abort the whole process.
+    let swallow = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        ctx.handle(event_type, keycode, flags)
+    })) {
+        Ok(swallow) => swallow,
+        Err(e) => {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic".to_string()
+            };
+            util::log(&format!("event tap panicked: {}", msg));
+            false // never swallow an event we failed to process
+        }
+    };
     if swallow {
         std::ptr::null_mut()
     } else {
@@ -345,7 +406,7 @@ impl TapCtx {
                 let prev_had = (self.mods_down & cmd) == cmd;
                 let now_had = (now & cmd) == cmd;
                 self.mods_down = now;
-                let mut core = self.shared.lock().unwrap();
+                let mut core = self.shared.lock().unwrap_or_else(|e| e.into_inner());
                 // The overlay's visibility tracks the hotkey modifier (⌘): it
                 // is shown only while ⌘ is held, and released on ⌘ release.
                 core.cmd_held = now & ffi::KCG_EVENT_FLAG_COMMAND != 0;
@@ -358,6 +419,10 @@ impl TapCtx {
                         // without it, taps near the threshold occasionally did
                         // nothing because the overlay had not shown yet.
                         core.quick_pending = false;
+                        // The pending show is cancelled, so it is no longer
+                        // "loading" — clear this too, otherwise the next ⌘Tab
+                        // would never re-arm and the switcher would go dead.
+                        core.quick_show_dispatched = false;
                         dispatch_main(MainCmd::QuickSwitch(core.quick_mode));
                     } else if core.visible {
                         // Releasing ⌘ switches to the window the selection box
@@ -382,14 +447,14 @@ impl TapCtx {
         let mods = flags & MOD_MASK;
         let h1 = HOTKEY_SPACE;
         let h2 = HOTKEY_APP;
-        let mut core = self.shared.lock().unwrap();
+        let mut core = self.shared.lock().unwrap_or_else(|e| e.into_inner());
 
         // ⌘Shift+Tab: open the space switcher backwards like the system.
         if !core.visible
             && keycode == ffi::KVK_TAB
             && mods == (ffi::KCG_EVENT_FLAG_COMMAND | ffi::KCG_EVENT_FLAG_SHIFT)
         {
-            dispatch_main(MainCmd::Show(Mode::Space));
+            dispatch_main(MainCmd::Show(Mode::Space, true));
             return true;
         }
 
@@ -525,7 +590,7 @@ fn arm_quick(core: &mut Core, mode: Mode) {
 pub fn start_quick_timer(shared: Arc<Mutex<Core>>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let mut core = shared.lock().unwrap();
+        let mut core = shared.lock().unwrap_or_else(|e| e.into_inner());
         if core.quick_pending
             && !core.quick_show_dispatched
             && core.cmd_held
@@ -535,7 +600,7 @@ pub fn start_quick_timer(shared: Arc<Mutex<Core>>) {
             let mode = core.quick_mode;
             // `quick_pending` stays set until Show() actually processes, so
             // repeated ⌘Tab keydowns while the overlay loads do not re-arm.
-            dispatch_main(MainCmd::Show(mode));
+            dispatch_main(MainCmd::Show(mode, true));
         }
     });
 }

@@ -264,11 +264,17 @@ pub fn window_ids_all() -> HashSet<u32> {
 /// scoped to. Each display's current desktop is its own independent world:
 /// `CGWindowList` is on-screen-only, so once windows are limited to one
 /// display's bounds they are exactly that display's current desktop.
+///
+/// `front_pid` is the frontmost app pid for `Mode::App`. It must be computed
+/// by the caller on the main thread when `collect` runs off-thread
+/// (NSWorkspace is AppKit and must not be touched from a background thread);
+/// `None` lets `collect` query it itself (only valid on the main thread).
 pub fn collect(
     cfg: &Config,
     mode: Mode,
     our_pid: u32,
     display: Option<&(f64, f64, f64, f64)>,
+    front_pid: Option<i32>,
 ) -> Vec<Item> {
     let mut wins = all_windows();
     wins.retain(|w| w.pid != our_pid as i32);
@@ -283,25 +289,35 @@ pub fn collect(
         }
     }
 
+    // Per-app window counts within the final (display-scoped) list. A count of
+    // 1 lets `activate_item` skip the AX raise/focus round trips entirely.
+    let mut counts: HashMap<i32, usize> = HashMap::new();
+    for w in &wins {
+        *counts.entry(w.pid).or_insert(0) += 1;
+    }
+
     match mode {
         Mode::Space => {
             // Every active window on the current Space, one entry per window.
             // (A per-app representative list was tried before, but the product
             // wants every window — e.g. multiple VSCode/Chrome windows.)
-            wins.iter().map(item_from).collect()
+            wins.iter().map(|w| item_from(w, counts[&w.pid])).collect()
         }
         Mode::App => {
             // Subset of Mode::Space: only the frontmost app's windows.
-            let front = frontmost_pid().unwrap_or(-1);
+            let front = match front_pid {
+                Some(p) => p,
+                None => frontmost_pid().unwrap_or(-1),
+            };
             if front <= 0 || front == our_pid as i32 {
                 return Vec::new();
             }
-            wins.iter().filter(|w| w.pid == front).map(item_from).collect()
+            wins.iter().filter(|w| w.pid == front).map(|w| item_from(w, counts[&w.pid])).collect()
         }
     }
 }
 
-fn item_from(w: &Win) -> Item {
+fn item_from(w: &Win, n_same_pid: usize) -> Item {
     let aspect = if w.h > 1.0 { w.w / w.h } else { 1.0 };
     Item {
         id: w.id,
@@ -313,6 +329,7 @@ fn item_from(w: &Win) -> Item {
         y: w.y,
         w: w.w,
         h: w.h,
+        n_same_pid,
     }
 }
 
@@ -441,8 +458,14 @@ fn ax_raise_window(item: &Item) -> bool {
 
 /// Activate the app of `item`, raising the window first (AX) when possible.
 pub fn activate_item(item: &Item) {
-    let ax_ok = ax_raise_window(item);
-    if !ax_ok {
+    // Single-window app: there is no ambiguity about which window to raise, so
+    // skip the AX round trips (AXUIElementCreateApplication + AXWindows copy +
+    // per-window bounds/title) and activate the app directly. Multi-window apps
+    // still go through AX so we raise the specific window (e.g. two same-bounds
+    // maximized VSCode windows on one display).
+    let multi = item.n_same_pid > 1;
+    let ax_ok = if multi { ax_raise_window(item) } else { false };
+    if multi && !ax_ok {
         util::log(&format!(
             "AX raise failed for [{}] {} (pid {}) — falling back to app activation",
             item.id, item.owner, item.pid

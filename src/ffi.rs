@@ -296,7 +296,9 @@ extern "C" {
         callout: Option<unsafe extern "C" fn(CFRunLoopTimerRef, *mut c_void)>,
         context: *const CFRunLoopTimerContext,
     ) -> CFRunLoopTimerRef;
+    pub fn CFRunLoopTimerSetNextFireDate(timer: CFRunLoopTimerRef, fireDate: CFTimeInterval);
     pub fn CFRunLoopAddTimer(rl: CFRunLoopRef, timer: CFRunLoopTimerRef, mode: CFStringRef);
+    pub fn CFAbsoluteTimeGetCurrent() -> CFTimeInterval;
     pub fn CFRunLoopWakeUp(rl: CFRunLoopRef);
     pub fn CFRunLoopGetMain() -> CFRunLoopRef;
 
