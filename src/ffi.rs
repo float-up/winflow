@@ -273,6 +273,9 @@ extern "C" {
         bufferSize: CFIndex,
         encoding: u32,
     ) -> bool;
+    /// Returns a pointer to the string's UTF-8 bytes if it is already stored in
+    /// that encoding (no copy), or NULL when a conversion is needed.
+    pub fn CFStringGetCStringPtr(string: CFStringRef, encoding: u32) -> *const c_char;
     pub fn CFStringGetLength(string: CFStringRef) -> CFIndex;
     pub fn CFNumberGetValue(number: CFNumberRef, theType: u32, valuePtr: *mut c_void) -> bool;
     pub fn CFGetTypeID(cf: CFTypeRef) -> CFTypeID;
@@ -476,11 +479,48 @@ unsafe impl Send for CgImage {}
 unsafe impl Sync for CgImage {}
 
 /// Interned CFString for repeated use; deliberately leaked (lives for process).
+///
+/// The fixed set of literals used across the codebase is served by a lock-free
+/// `OnceLock` per key (the previous single `Mutex<HashMap>` was taken on every
+/// call — e.g. 4×/window in `cf_dict_bounds`). Unknown literals fall back to a
+/// shared map so future call sites still work without panicking.
 pub fn cstr_static(s: &'static str) -> CFStringRef {
+    if let Some(entry) = known_static_str(s) {
+        return entry.get_or_init(|| RawPtr(cf_string(s))).0;
+    }
     static CACHE: OnceLock<Mutex<HashMap<&'static str, RawPtr>>> = OnceLock::new();
     let m = CACHE.get_or_init(Default::default);
     let mut m = m.lock().unwrap();
     m.entry(s).or_insert_with(|| RawPtr(cf_string(s))).0
+}
+
+/// Lock-free per-literal intern slots for the known `cstr_static` keys.
+fn known_static_str(s: &'static str) -> Option<&'static OnceLock<RawPtr>> {
+    static X: OnceLock<RawPtr> = OnceLock::new();
+    static Y: OnceLock<RawPtr> = OnceLock::new();
+    static WIDTH: OnceLock<RawPtr> = OnceLock::new();
+    static HEIGHT: OnceLock<RawPtr> = OnceLock::new();
+    static AX_POSITION: OnceLock<RawPtr> = OnceLock::new();
+    static AX_SIZE: OnceLock<RawPtr> = OnceLock::new();
+    static AX_PID: OnceLock<RawPtr> = OnceLock::new();
+    static AX_WINDOWS: OnceLock<RawPtr> = OnceLock::new();
+    static AX_TITLE: OnceLock<RawPtr> = OnceLock::new();
+    static AX_RAISE: OnceLock<RawPtr> = OnceLock::new();
+    static AX_FOCUSED_WINDOW: OnceLock<RawPtr> = OnceLock::new();
+    match s {
+        "X" => Some(&X),
+        "Y" => Some(&Y),
+        "Width" => Some(&WIDTH),
+        "Height" => Some(&HEIGHT),
+        "AXPosition" => Some(&AX_POSITION),
+        "AXSize" => Some(&AX_SIZE),
+        "AXPid" => Some(&AX_PID),
+        "AXWindows" => Some(&AX_WINDOWS),
+        "AXTitle" => Some(&AX_TITLE),
+        "AXRaise" => Some(&AX_RAISE),
+        "AXFocusedWindow" => Some(&AX_FOCUSED_WINDOW),
+        _ => None,
+    }
 }
 
 /// Convert a CFTypeRef that is a CFString into a Rust String.
@@ -488,11 +528,20 @@ pub unsafe fn cf_string_value(v: CFTypeRef) -> Option<String> {
     if v.is_null() || CFGetTypeID(v) != CFStringGetTypeID() {
         return None;
     }
-    let len = CFStringGetLength(v as CFStringRef);
+    let s = v as CFStringRef;
+    // Fast path: when the string is already stored as UTF-8, read it in place
+    // (no allocation/copy). Window owners/titles are often plain ASCII/UTF-8,
+    // and this runs once per window per field in the hot enumeration loop.
+    let ptr = CFStringGetCStringPtr(s, KCF_STRING_ENCODING_UTF8);
+    if !ptr.is_null() {
+        return Some(std::ffi::CStr::from_ptr(ptr).to_string_lossy().into_owned());
+    }
+    // Slow path: convert into a temporary buffer.
+    let len = CFStringGetLength(s);
     let cap = (len * 4 + 8) as usize;
     let mut buf = vec![0u8; cap];
     let ok = CFStringGetCString(
-        v as CFStringRef,
+        s,
         buf.as_mut_ptr() as *mut c_char,
         cap as CFIndex,
         KCF_STRING_ENCODING_UTF8,

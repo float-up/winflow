@@ -158,22 +158,34 @@ fn sanitize(wins: &mut Vec<Win>, cfg: &Config) {
     let titles_available = wins.iter().any(|w| !w.title.is_empty());
     let n = wins.len();
     let mut remove = vec![false; n];
+
+    // Group indices by pid: only same-app windows can contain one another, so
+    // the containment scan is per-app instead of an O(n²) cross-app sweep. With
+    // many apps this turns sum(group_size²) comparisons into just the few
+    // relevant ones.
+    let mut by_pid: HashMap<i32, Vec<usize>> = HashMap::new();
+    for (i, w) in wins.iter().enumerate() {
+        by_pid.entry(w.pid).or_default().push(i);
+    }
+
     for (i, w) in wins.iter().enumerate() {
         let empty_title = titles_available && w.title.is_empty();
         let mut suspicious = empty_title || w.alpha < 0.98;
         if !suspicious {
-            for (j, o) in wins.iter().enumerate() {
-                if i == j {
-                    continue;
-                }
-                let contained = o.pid == w.pid
-                    && o.x <= w.x + 2.0
-                    && o.y <= w.y + 2.0
-                    && o.x + o.w >= w.x + w.w - 2.0
-                    && o.y + o.h >= w.y + w.h - 2.0;
-                if contained && (w.w * w.h) < 0.3 * (o.w * o.h) {
-                    suspicious = true;
-                    break;
+            if let Some(group) = by_pid.get(&w.pid) {
+                for &j in group {
+                    if i == j {
+                        continue;
+                    }
+                    let o = &wins[j];
+                    let contained = o.x <= w.x + 2.0
+                        && o.y <= w.y + 2.0
+                        && o.x + o.w >= w.x + w.w - 2.0
+                        && o.y + o.h >= w.y + w.h - 2.0;
+                    if contained && (w.w * w.h) < 0.3 * (o.w * o.h) {
+                        suspicious = true;
+                        break;
+                    }
                 }
             }
         }
