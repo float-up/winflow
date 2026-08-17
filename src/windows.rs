@@ -291,21 +291,37 @@ pub fn collect(
     let mut wins = all_windows();
     wins.retain(|w| w.pid != our_pid as i32);
     sanitize(&mut wins, cfg);
+    scope_and_annotate(wins, mode, display, front_pid, our_pid)
+}
+
+/// Post-sanitize stage of `collect`: compute per-app sibling counts, scope to
+/// the target display, then map to items.
+///
+/// Counts MUST be computed over the GLOBAL on-screen list (before scoping):
+/// `activate_item` skips the AX raise/focus round trips only when the count is
+/// 1. Using the display-scoped count would mislabel a multi-display app (e.g.
+/// one VSCode window per display) as "single-window", and `ActivateAllWindows`
+/// would then wrongly raise the windows on the OTHER displays too.
+fn scope_and_annotate(
+    wins: Vec<Win>,
+    mode: Mode,
+    display: Option<&(f64, f64, f64, f64)>,
+    front_pid: Option<i32>,
+    our_pid: u32,
+) -> Vec<Item> {
+    let mut counts: HashMap<i32, usize> = HashMap::new();
+    for w in &wins {
+        *counts.entry(w.pid).or_insert(0) += 1;
+    }
 
     // Scope to the target display. If nothing matches (e.g. no Screen
     // Recording permission -> bounds key missing), fall back to unfiltered.
+    let mut wins = wins;
     if let Some(b) = display {
         let matched = wins.iter().filter(|w| center_in_bounds(w, *b)).count();
         if matched > 0 {
             wins.retain(|w| center_in_bounds(w, *b));
         }
-    }
-
-    // Per-app window counts within the final (display-scoped) list. A count of
-    // 1 lets `activate_item` skip the AX raise/focus round trips entirely.
-    let mut counts: HashMap<i32, usize> = HashMap::new();
-    for w in &wins {
-        *counts.entry(w.pid).or_insert(0) += 1;
     }
 
     match mode {
@@ -470,11 +486,12 @@ fn ax_raise_window(item: &Item) -> bool {
 
 /// Activate the app of `item`, raising the window first (AX) when possible.
 pub fn activate_item(item: &Item) {
-    // Single-window app: there is no ambiguity about which window to raise, so
-    // skip the AX round trips (AXUIElementCreateApplication + AXWindows copy +
-    // per-window bounds/title) and activate the app directly. Multi-window apps
-    // still go through AX so we raise the specific window (e.g. two same-bounds
-    // maximized VSCode windows on one display).
+    // A globally single-window app has no ambiguity about which window to
+    // raise, so skip the AX round trips and activate the app directly. Apps
+    // with more than one on-screen window (across all displays — e.g. one
+    // VSCode window per display, or two same-bounds VSCode windows) still go
+    // through AX so we raise the specific window instead of `ActivateAllWindows`
+    // (which would wrongly raise the other displays' windows too).
     let multi = item.n_same_pid > 1;
     let ax_ok = if multi { ax_raise_window(item) } else { false };
     if multi && !ax_ok {
@@ -628,5 +645,30 @@ mod sanitize_tests {
         ];
         sanitize(&mut wins, &Config::default());
         assert_eq!(wins.len(), 3);
+    }
+
+    #[test]
+    fn multi_display_app_keeps_global_sibling_count() {
+        // Regression: an app with one window per display must keep
+        // n_same_pid == 2 even after scoping to a single display. A scoped
+        // count of 1 would make `activate_item` skip AX and use
+        // `ActivateAllWindows`, wrongly raising the OTHER display's window too.
+        let wins = vec![
+            win(24334, 9601, "a.ts", 0.0, 30.0, 1920.0, 1050.0),     // display 1
+            win(24334, 9602, "b.ts", 2560.0, 30.0, 1920.0, 1050.0),  // display 2
+        ];
+        let display2 = (2560.0, 0.0, 1920.0, 1080.0);
+        let items = scope_and_annotate(wins, Mode::Space, Some(&display2), None, 9999);
+        assert_eq!(items.len(), 1, "only the display-2 window is in scope");
+        assert_eq!(items[0].id, 9602);
+        assert_eq!(items[0].n_same_pid, 2, "sibling count must be global, not scoped");
+    }
+
+    #[test]
+    fn single_window_app_sibling_count_one() {
+        let wins = vec![win(7, 1, "only", 0.0, 0.0, 800.0, 600.0)];
+        let items = scope_and_annotate(wins, Mode::Space, None, None, 9999);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].n_same_pid, 1);
     }
 }
