@@ -314,14 +314,15 @@ fn scope_and_annotate(
         *counts.entry(w.pid).or_insert(0) += 1;
     }
 
-    // Scope to the target display. If nothing matches (e.g. no Screen
-    // Recording permission -> bounds key missing), fall back to unfiltered.
+    // Scope to the target display. A failed match is intentionally empty:
+    // falling back to the global list would violate display isolation.
     let mut wins = wins;
     if let Some(b) = display {
         let matched = wins.iter().filter(|w| center_in_bounds(w, *b)).count();
-        if matched > 0 {
-            wins.retain(|w| center_in_bounds(w, *b));
+        if matched == 0 {
+            return Vec::new();
         }
+        wins.retain(|w| center_in_bounds(w, *b));
     }
 
     match mode {
@@ -684,5 +685,13 @@ mod sanitize_tests {
         let items = scope_and_annotate(wins, Mode::Space, None, None, 9999);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].n_same_pid, 1);
+    }
+
+    #[test]
+    fn display_filter_failure_returns_empty() {
+        let wins = vec![win(7, 1, "only", 0.0, 0.0, 800.0, 600.0)];
+        let display = (2000.0, 0.0, 1000.0, 800.0);
+        let items = scope_and_annotate(wins, Mode::Space, Some(&display), None, 9999);
+        assert!(items.is_empty());
     }
 }

@@ -4,7 +4,7 @@
 
 use crate::ffi;
 use crate::state::{Core, MainCmd};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -33,16 +33,19 @@ struct Job {
 }
 
 pub fn start(
+    cfg: crate::config::Config,
     shared: Arc<Mutex<Core>>,
     thumbs: Arc<RwLock<ThumbCache>>,
     thumb_px_h: usize,
 ) {
     let (tx, rx) = std::sync::mpsc::channel::<Job>();
     let rx = Arc::new(Mutex::new(rx));
+    let in_flight = Arc::new(Mutex::new(HashSet::<u32>::new()));
     for _ in 0..2 {
         let rx = rx.clone();
         let thumbs = thumbs.clone();
-        std::thread::spawn(move || worker(rx, thumbs, thumb_px_h));
+        let in_flight = in_flight.clone();
+        std::thread::spawn(move || worker(rx, thumbs, in_flight, thumb_px_h));
     }
     std::thread::spawn(move || {
         let mut last_stale_pass = Instant::now();
@@ -91,7 +94,7 @@ pub fn start(
             if resync {
                 last_resync = Instant::now();
                 core.tracked = crate::windows::onscreen_window_ids(
-                    &crate::config::Config::default(),
+                    &cfg,
                     std::process::id(),
                 );
             }
@@ -107,11 +110,17 @@ pub fn start(
                 let mut jobs: Vec<Job> = Vec::new();
                 for id in core.tracked.iter() {
                     match thumbs_r.get(id) {
-                        None => jobs.push(Job { id: *id }),
+                        None => {
+                            if in_flight.lock().unwrap().insert(*id) {
+                                jobs.push(Job { id: *id });
+                            }
+                        }
                         Some(th) => {
                             let provisional = !th.confirmed && th.at.elapsed() >= SETTLE;
                             let stale = stale_due && th.at.elapsed() > interval;
-                            if provisional || stale {
+                            if (provisional || stale)
+                                && in_flight.lock().unwrap().insert(*id)
+                            {
                                 jobs.push(Job { id: *id });
                             }
                         }
@@ -129,11 +138,17 @@ pub fn start(
     });
 }
 
-fn worker(rx: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>, thumbs: Arc<RwLock<ThumbCache>>, thumb_px_h: usize) {
+fn worker(
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<Job>>>,
+    thumbs: Arc<RwLock<ThumbCache>>,
+    in_flight: Arc<Mutex<HashSet<u32>>>,
+    thumb_px_h: usize,
+) {
     loop {
         let job = rx.lock().unwrap().recv();
         let Ok(job) = job else { return };
         let img = unsafe { ffi::capture_window_image(job.id, thumb_px_h) };
+        in_flight.lock().unwrap().remove(&job.id);
         if img.is_null() {
             continue;
         }

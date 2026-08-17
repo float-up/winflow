@@ -28,9 +28,9 @@ const SYMBOL: &str = "rectangle.grid.2x2";
 // The status item and menu target are not retained by the system (target is
 // weak; the bar does not own the item), so keep them alive for the whole
 // process. Raw pointers are deliberate process-lifetime leaks.
-static KEEP_ITEM: std::sync::OnceLock<ffi::RawPtr> = std::sync::OnceLock::new();
-static KEEP_TARGET: std::sync::OnceLock<ffi::RawPtr> = std::sync::OnceLock::new();
-static KEEP_PANEL_TARGET: std::sync::OnceLock<ffi::RawPtr> = std::sync::OnceLock::new();
+static KEEP_ITEM: std::sync::OnceLock<ffi::ProcessPtr> = std::sync::OnceLock::new();
+static KEEP_TARGET: std::sync::OnceLock<ffi::ProcessPtr> = std::sync::OnceLock::new();
+static KEEP_PANEL_TARGET: std::sync::OnceLock<ffi::ProcessPtr> = std::sync::OnceLock::new();
 
 /// Install the menu bar icon + menu. Call once from the main thread.
 pub fn install() {
@@ -71,8 +71,8 @@ pub fn install() {
         let ok2: bool = msg_send![&target, respondsToSelector: sel!(quit:)];
 
         // Keep alive for process lifetime.
-        let _ = KEEP_ITEM.set(ffi::RawPtr(Retained::into_raw(item) as *const _));
-        let _ = KEEP_TARGET.set(ffi::RawPtr(Retained::into_raw(target) as *const _));
+        let _ = KEEP_ITEM.set(ffi::ProcessPtr(Retained::into_raw(item) as *const _));
+        let _ = KEEP_TARGET.set(ffi::ProcessPtr(Retained::into_raw(target) as *const _));
 
         util::log(&format!("menu bar icon installed (actions ok: {} {})", ok1, ok2));
     }
@@ -123,9 +123,9 @@ fn fallback_icon() -> Retained<NSImage> {
 /// Shared panel state (raw pointers, main-thread only). The window is created
 /// lazily on first open and reused; closing hides it (never deallocates).
 struct PanelState {
-    window: ffi::RawPtr,  // *const NSWindow, main-thread only
-    field: ffi::RawPtr,   // *const NSTextField (capture interval), main-thread only
-    field2: ffi::RawPtr,  // *const NSTextField (quick-tap delay), main-thread only
+    window: ffi::MainThreadPtr,  // *const NSWindow, main-thread only
+    field: ffi::MainThreadPtr,   // *const NSTextField (capture interval), main-thread only
+    field2: ffi::MainThreadPtr,  // *const NSTextField (quick-tap delay), main-thread only
 }
 
 static PANEL: std::sync::OnceLock<std::sync::Mutex<Option<PanelState>>> = std::sync::OnceLock::new();
@@ -227,11 +227,11 @@ fn open_config_panel() {
         ));
 
         // Keep the panel target (weak by default) and the window alive.
-        let _ = KEEP_PANEL_TARGET.set(ffi::RawPtr(Retained::into_raw(target) as *const _));
+        let _ = KEEP_PANEL_TARGET.set(ffi::ProcessPtr(Retained::into_raw(target) as *const _));
         *st = Some(PanelState {
-            window: ffi::RawPtr(Retained::into_raw(win) as *const _),
-            field: ffi::RawPtr(Retained::into_raw(field) as *const _),
-            field2: ffi::RawPtr(Retained::into_raw(field2) as *const _),
+            window: ffi::MainThreadPtr(Retained::into_raw(win) as *mut _),
+            field: ffi::MainThreadPtr(Retained::into_raw(field) as *mut _),
+            field2: ffi::MainThreadPtr(Retained::into_raw(field2) as *mut _),
         });
     }
 }

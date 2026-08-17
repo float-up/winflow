@@ -9,6 +9,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+pub const DEFAULT_CAPTURE_INTERVAL_SECS: u64 = 45;
+pub const DEFAULT_QUICK_DELAY_MS: u64 = 80;
+
 #[derive(Clone, Debug)]
 pub struct Config {
     /// Background thumbnail capture interval.
@@ -36,8 +39,8 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Config {
-            capture_interval: Duration::from_secs(45),
-            quick_delay: Duration::from_millis(80),
+            capture_interval: Duration::from_secs(DEFAULT_CAPTURE_INTERVAL_SECS),
+            quick_delay: Duration::from_millis(DEFAULT_QUICK_DELAY_MS),
             thumb_height: 200.0,
             thumb_px_scale: 1.0,
             max_width_frac: 0.8,
@@ -127,8 +130,8 @@ mod tests {
         // 1) Missing file -> defaults.
         let _ = std::fs::remove_dir_all(&dir);
         let cfg = load();
-        assert_eq!(cfg.capture_interval, Duration::from_secs(45));
-        assert_eq!(cfg.quick_delay, Duration::from_millis(80));
+        assert_eq!(cfg.capture_interval, Duration::from_secs(DEFAULT_CAPTURE_INTERVAL_SECS));
+        assert_eq!(cfg.quick_delay, Duration::from_millis(DEFAULT_QUICK_DELAY_MS));
 
         // 2) Save + load roundtrip.
         std::fs::create_dir_all(&dir).unwrap();
