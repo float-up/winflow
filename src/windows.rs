@@ -396,12 +396,26 @@ fn ax_raise_window(item: &Item) -> bool {
     let n = unsafe { ffi::cf_array_count(arr) };
     let mut target: ffi::AXUIElementRef = std::ptr::null();
 
+    // Pass 0: match by CGWindowID. `_AXUIElementGetWindow` maps an AX window
+    // element to its CGWindowNumber, which is exactly `item.id` — authoritative
+    // and immune to AX/CG coordinate mismatches (which otherwise confuse two
+    // same-size windows of one app on different displays).
+    for i in 0..n {
+        let el = unsafe { ffi::cf_array_get(arr, i) };
+        let ax = el as ffi::AXUIElementRef;
+        let mut cg_id: ffi::CGWindowID = 0;
+        if unsafe { ffi::_AXUIElementGetWindow(ax, &mut cg_id) } == 0 && cg_id == item.id {
+            target = ax;
+            break;
+        }
+    }
+
     // Pass 1: prefer the AX window whose pid, bounds AND title match. Two
     // maximized windows of the same app (e.g. VSCode) have identical bounds,
     // so matching by bounds alone raises the frontmost one instead of the
     // selected one. The pid check guards against apps that proxy windows
     // from helper/child processes into their AXWindows list.
-    if !item.title.is_empty() {
+    if target.is_null() && !item.title.is_empty() {
         for i in 0..n {
             let el = unsafe { ffi::cf_array_get(arr, i) };
             let ax = el as ffi::AXUIElementRef;

@@ -342,6 +342,10 @@ extern "C" {
     ) -> i32;
     pub fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
     pub fn AXValueGetValue(value: CFTypeRef, type_: u32, valuePtr: *mut c_void) -> bool;
+    /// Private-but-stable SPI: map an AX window element to its CGWindowID
+    /// (kAXErrorSuccess = 0 writes the id). More authoritative than matching by
+    /// bounds, which can confuse same-size windows of one app across displays.
+    pub fn _AXUIElementGetWindow(element: AXUIElementRef, out_window: *mut CGWindowID) -> i32;
 }
 
 // ---------- safe wrappers ----------
