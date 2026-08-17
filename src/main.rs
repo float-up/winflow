@@ -70,6 +70,7 @@ fn main() {
         core.refresh_all = true;
     }
     capture::start(
+        cfg.clone(),
         shared.clone(),
         thumbs.clone(),
         (cfg.thumb_height * overlay::screen_scale() * cfg.thumb_px_scale).round() as usize,

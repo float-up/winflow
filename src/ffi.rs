@@ -462,15 +462,33 @@ pub fn cf_string(s: &str) -> CFStringRef {
     unsafe { CFStringCreateWithCString(std::ptr::null(), c.as_ptr(), KCF_STRING_ENCODING_UTF8) }
 }
 
-/// A raw pointer that is explicitly `Send + Sync`. Only used for pointers
-/// that are either immutable for the process lifetime or carefully guarded
-/// by the surrounding synchronization (e.g. the event-tap context).
+/// A pointer to an immutable, process-lifetime object.
 #[derive(Clone, Copy)]
-pub struct RawPtr(pub *const c_void);
-unsafe impl Send for RawPtr {}
-unsafe impl Sync for RawPtr {}
-impl RawPtr {
+pub struct ProcessPtr(pub *const c_void);
+unsafe impl Send for ProcessPtr {}
+unsafe impl Sync for ProcessPtr {}
+impl ProcessPtr {
     pub fn get(&self) -> *const c_void {
+        self.0
+    }
+}
+
+/// A pointer moved once into a dedicated worker thread.
+#[derive(Clone, Copy)]
+pub struct ThreadPtr(pub *const c_void);
+unsafe impl Send for ThreadPtr {}
+impl ThreadPtr {
+    pub fn get(&self) -> *const c_void {
+        self.0
+    }
+}
+
+/// A retained AppKit pointer owned and accessed by the main thread.
+#[derive(Clone, Copy)]
+pub struct MainThreadPtr(pub *mut c_void);
+unsafe impl Send for MainThreadPtr {}
+impl MainThreadPtr {
+    pub fn get(&self) -> *mut c_void {
         self.0
     }
 }
@@ -490,27 +508,27 @@ unsafe impl Sync for CgImage {}
 /// shared map so future call sites still work without panicking.
 pub fn cstr_static(s: &'static str) -> CFStringRef {
     if let Some(entry) = known_static_str(s) {
-        return entry.get_or_init(|| RawPtr(cf_string(s))).0;
+        return entry.get_or_init(|| ProcessPtr(cf_string(s))).0;
     }
-    static CACHE: OnceLock<Mutex<HashMap<&'static str, RawPtr>>> = OnceLock::new();
+    static CACHE: OnceLock<Mutex<HashMap<&'static str, ProcessPtr>>> = OnceLock::new();
     let m = CACHE.get_or_init(Default::default);
     let mut m = m.lock().unwrap();
-    m.entry(s).or_insert_with(|| RawPtr(cf_string(s))).0
+    m.entry(s).or_insert_with(|| ProcessPtr(cf_string(s))).0
 }
 
 /// Lock-free per-literal intern slots for the known `cstr_static` keys.
-fn known_static_str(s: &'static str) -> Option<&'static OnceLock<RawPtr>> {
-    static X: OnceLock<RawPtr> = OnceLock::new();
-    static Y: OnceLock<RawPtr> = OnceLock::new();
-    static WIDTH: OnceLock<RawPtr> = OnceLock::new();
-    static HEIGHT: OnceLock<RawPtr> = OnceLock::new();
-    static AX_POSITION: OnceLock<RawPtr> = OnceLock::new();
-    static AX_SIZE: OnceLock<RawPtr> = OnceLock::new();
-    static AX_PID: OnceLock<RawPtr> = OnceLock::new();
-    static AX_WINDOWS: OnceLock<RawPtr> = OnceLock::new();
-    static AX_TITLE: OnceLock<RawPtr> = OnceLock::new();
-    static AX_RAISE: OnceLock<RawPtr> = OnceLock::new();
-    static AX_FOCUSED_WINDOW: OnceLock<RawPtr> = OnceLock::new();
+fn known_static_str(s: &'static str) -> Option<&'static OnceLock<ProcessPtr>> {
+    static X: OnceLock<ProcessPtr> = OnceLock::new();
+    static Y: OnceLock<ProcessPtr> = OnceLock::new();
+    static WIDTH: OnceLock<ProcessPtr> = OnceLock::new();
+    static HEIGHT: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_POSITION: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_SIZE: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_PID: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_WINDOWS: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_TITLE: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_RAISE: OnceLock<ProcessPtr> = OnceLock::new();
+    static AX_FOCUSED_WINDOW: OnceLock<ProcessPtr> = OnceLock::new();
     match s {
         "X" => Some(&X),
         "Y" => Some(&Y),
@@ -748,7 +766,5 @@ pub unsafe fn ax_copy_pid(el: AXUIElementRef) -> Option<i32> {
         None
     }
 }
-
-
 
 

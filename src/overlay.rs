@@ -33,21 +33,20 @@ use std::ffi::c_void;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Instant;
 
-/// Main-thread-only UI state. `unsafe impl Send` is sound because every
-/// access goes through `with_app` which only ever runs on the main thread
-/// (dispatch main queue / AppKit event dispatch).
+/// Main-thread-only UI state. The pointer fields are explicitly marked as
+/// main-thread-owned; `with_app` is only called from the main run loop.
 pub struct AppInner {
     shared: Arc<Mutex<Core>>,
     thumbs: Arc<RwLock<ThumbCache>>,
     cfg: Config,
     /// Retained NSWindow* (lazily created).
-    panel: *mut c_void,
+    panel: ffi::MainThreadPtr,
     /// Retained NSImageView* (content view of `panel`).
-    image_view: *mut c_void,
+    image_view: ffi::MainThreadPtr,
     /// Retained local event monitor.
-    _monitor: *mut c_void,
+    _monitor: ffi::MainThreadPtr,
     /// window id -> (thumb gen, retained NSImage*).
-    thumb_ns: HashMap<u32, (u64, *mut c_void)>,
+    thumb_ns: HashMap<u32, (u64, ffi::MainThreadPtr)>,
     /// App pid that was frontmost right before the overlay opened.
     prev_app_pid: Option<i32>,
     /// Frontmost window id on the overlay's display (CG order, before the MRU
@@ -79,8 +78,6 @@ pub struct AppInner {
     hint: Option<(String, Instant)>,
 }
 
-unsafe impl Send for AppInner {}
-
 /// Cached result of a `windows::collect` call (see `COLLECT_CACHE_TTL`).
 struct CollectCache {
     mode: Mode,
@@ -96,9 +93,9 @@ static APP: OnceLock<Mutex<AppInner>> = OnceLock::new();
 /// not reentrant and may already be held by the command processor).
 static SHARED: OnceLock<Arc<Mutex<Core>>> = OnceLock::new();
 static CAPTURE_INTERVAL_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(45_000);
+    std::sync::atomic::AtomicU64::new(crate::config::DEFAULT_CAPTURE_INTERVAL_SECS * 1000);
 static QUICK_DELAY_MS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(80);
+    std::sync::atomic::AtomicU64::new(crate::config::DEFAULT_QUICK_DELAY_MS);
 
 /// After we activate a window ourselves, trust our stored pair (instead of the
 /// frontmost query) for this long. `activateWithOptions` is asynchronous, so
@@ -140,9 +137,9 @@ pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbC
         shared,
         thumbs,
         cfg,
-        panel: std::ptr::null_mut(),
-        image_view: std::ptr::null_mut(),
-        _monitor: std::ptr::null_mut(),
+        panel: ffi::MainThreadPtr(std::ptr::null_mut()),
+        image_view: ffi::MainThreadPtr(std::ptr::null_mut()),
+        _monitor: ffi::MainThreadPtr(std::ptr::null_mut()),
         thumb_ns: HashMap::new(),
         prev_app_pid: None,
         front_window: None,
@@ -229,7 +226,7 @@ impl AppInner {
             MainCmd::Hide => self.hide(true),
             MainCmd::ThumbUpdated(id) => {
                 if let Some((_, p)) = self.thumb_ns.remove(&id) {
-                    unsafe { ffi::cf_release(p as *const c_void) };
+                    unsafe { ffi::cf_release(p.get() as *const c_void) };
                 }
                 // Don't recompose here: a burst of thumbnails would trigger N
                 // full redraws. Coalesce into the next tick.
@@ -378,7 +375,7 @@ impl AppInner {
         }
         self.redraw();
         unsafe {
-            let win = &*(self.panel as *const NSWindow);
+            let win = &*(self.panel.get() as *const NSWindow);
             let _: () = msg_send![&*win, makeKeyAndOrderFront: None::<&NSObject>];
             let app = NSApplication::sharedApplication(mtm());
             let _: () = msg_send![&app, activateIgnoringOtherApps: true];
@@ -452,7 +449,7 @@ impl AppInner {
         self.scroll_acc = 0.0;
         if self.initialized {
             unsafe {
-                let win = &*(self.panel as *const NSWindow);
+                let win = &*(self.panel.get() as *const NSWindow);
                 let _: () = msg_send![&*win, orderOut: None::<&NSObject>];
             }
         }
@@ -692,9 +689,9 @@ impl AppInner {
         let (img, (w, h)) = self.compose(&items, &layout, selection);
         dump_image_once(&img, w, h);
         unsafe {
-            let iv = &*(self.image_view as *const NSImageView);
+            let iv = &*(self.image_view.get() as *const NSImageView);
             let _: () = msg_send![&*iv, setImage: &*img];
-            let win = &*(self.panel as *const NSWindow);
+            let win = &*(self.panel.get() as *const NSWindow);
             let cur: NSRect = msg_send![&*win, frame];
             let (fx, fy, fw, fh) = self.target_screen_frame();
             let x = fx + (fw - w) / 2.0;
@@ -743,11 +740,11 @@ impl AppInner {
                     };
                     if need {
                         let ns = build_ns_image(cg.0);
-                        if let Some(old) = self.thumb_ns.insert(it.id, (gen, Retained::into_raw(ns) as *mut c_void)) {
-                            unsafe { ffi::cf_release(old.1 as *const c_void) };
+                        if let Some(old) = self.thumb_ns.insert(it.id, (gen, ffi::MainThreadPtr(Retained::into_raw(ns) as *mut c_void))) {
+                            unsafe { ffi::cf_release(old.1.get() as *const c_void) };
                         }
                     }
-                    ns_ptrs.push(self.thumb_ns.get(&it.id).map(|(_, p)| *p as *const c_void));
+                    ns_ptrs.push(self.thumb_ns.get(&it.id).map(|(_, p)| p.get() as *const c_void));
                 }
                 None => ns_ptrs.push(None),
             }
@@ -1080,7 +1077,7 @@ impl AppInner {
             self.thumb_ns.retain(|id, (_, p)| {
                 let keep = tracked.contains(id);
                 if !keep {
-                    unsafe { ffi::cf_release(*p as *const c_void) };
+                    unsafe { ffi::cf_release(p.get() as *const c_void) };
                 }
                 keep
             });
@@ -1145,10 +1142,10 @@ impl AppInner {
                 handler: &*blk
             ];
 
-            self.panel = Retained::into_raw(win) as *mut c_void;
-            self.image_view = Retained::into_raw(iv) as *mut c_void;
+            self.panel = ffi::MainThreadPtr(Retained::into_raw(win) as *mut c_void);
+            self.image_view = ffi::MainThreadPtr(Retained::into_raw(iv) as *mut c_void);
             if let Some(m) = mon {
-                self._monitor = Retained::into_raw(m) as *mut c_void;
+                self._monitor = ffi::MainThreadPtr(Retained::into_raw(m) as *mut c_void);
             }
             self.initialized = true;
         }
@@ -1329,17 +1326,17 @@ fn build_ns_image(cg: ffi::CGImageRef) -> Retained<NSImage> {
 }
 
 fn font_key() -> &'static NSString {
-    static KEY: OnceLock<ffi::RawPtr> = OnceLock::new();
+    static KEY: OnceLock<ffi::ProcessPtr> = OnceLock::new();
     let p = KEY.get_or_init(|| {
-        ffi::RawPtr(Retained::into_raw(util::ns_string("NSFont")) as *const c_void)
+        ffi::ProcessPtr(Retained::into_raw(util::ns_string("NSFont")) as *const c_void)
     });
     unsafe { &*(p.get() as *const NSString) }
 }
 
 fn color_key() -> &'static NSString {
-    static KEY: OnceLock<ffi::RawPtr> = OnceLock::new();
+    static KEY: OnceLock<ffi::ProcessPtr> = OnceLock::new();
     let p = KEY.get_or_init(|| {
-        ffi::RawPtr(Retained::into_raw(util::ns_string("NSColor")) as *const c_void)
+        ffi::ProcessPtr(Retained::into_raw(util::ns_string("NSColor")) as *const c_void)
     });
     unsafe { &*(p.get() as *const NSString) }
 }

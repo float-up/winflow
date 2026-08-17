@@ -40,14 +40,14 @@ hjkl / 方向键 / 鼠标 多种切换方式。
    选中 `prev`（从 A 切到 B 后再次唤起，默认选中 A，再按一次回 B）。
    外部切换（点击其他窗口）在 show 时同步进 `active`/`mru`。
 7. **快速切换（可配置延迟）+ 叠加层随 ⌘ 显隐**：热键按下不立即弹叠加层——
-   在 `quick_delay_ms`（默认 200ms，面板可调）内松开修饰键 → `QuickSwitch`
+   在 `quick_delay_ms`（默认 80ms，面板可调）内松开修饰键 → `QuickSwitch`
    直接激活 `prev_window`（不弹界面）；超过延迟仍按住 ⌘ → 弹叠加层，
    **且只要不松开 ⌘ 就一直展示**（即使没有选择任何窗口）。
    **松开 ⌘ 自动切换到选中框选中的窗口并关闭叠加层**（无需回车/点选
    显式确认），下次按下重新唤起；回车/鼠标点选仍是显式切换方式。状态机：`quick_pending` +
    `quick_show_dispatched` + `cmd_held`（tap 线程在 flags 变化时写入；
    timer 只在 ⌘ 仍按住时派发 Show；重复 Tab 不重新 arm）。
-8. **后台定时截图**：后台线程按间隔（默认 **10s**）定时截取活跃窗口的
+8. **后台定时截图**：后台线程按间隔（默认 **45s**）定时截取活跃窗口的
    窗口图，缓存到共享内存，唤醒时优先用缓存（秒开），并异步刷新。
    **启动即预热**：`main()` 在启动时把当前可见窗口写入 `core.tracked`
    并置 `refresh_all`，调度线程首轮（~50ms）立即截取；叠加层未打开期间
@@ -106,7 +106,7 @@ hjkl / 方向键 / 鼠标 多种切换方式。
   `setActivationPolicy:` / `activateWithOptions:` 实际返回 BOOL；
   `kCGWindowIsOnscreen` 是 CFBoolean 不是 CFNumber；Rust 2021 闭包
   对 `ptr.0` 这类字段访问会做 disjoint capture（导致 raw pointer 无法
-  Send），跨线程移动指针时用 `RawPtr::get()` 之类的封装方法访问。
+  Send），跨线程移动指针时用 `ThreadPtr::get()` 之类的封装方法访问。
 
 ## 三、架构模块（src/）
 

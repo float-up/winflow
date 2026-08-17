@@ -139,11 +139,11 @@ impl Core {
             quick_show_dispatched: false,
             quick_deadline: std::time::Instant::now(),
             quick_mode: Mode::Space,
-            quick_delay_ms: 80,
+            quick_delay_ms: crate::config::DEFAULT_QUICK_DELAY_MS,
             tracked: Vec::new(),
             refresh_all: false,
             wrap,
-            capture_interval_ms: 45_000,
+            capture_interval_ms: crate::config::DEFAULT_CAPTURE_INTERVAL_SECS * 1000,
             cmd_held: false,
             tags: [None, None, None],
         }
@@ -241,7 +241,7 @@ pub struct ShowData {
 static CMD_QUEUE: std::sync::OnceLock<Mutex<Vec<MainCmd>>> = std::sync::OnceLock::new();
 /// The main-thread drain timer, kept so `dispatch_main` can re-arm it to fire
 /// immediately from background threads (see `dispatch_main`).
-static CMD_TIMER: std::sync::OnceLock<ffi::RawPtr> = std::sync::OnceLock::new();
+static CMD_TIMER: std::sync::OnceLock<ffi::ProcessPtr> = std::sync::OnceLock::new();
 
 /// Must be called on the main thread before background threads start.
 pub fn init_cmd_timer() {
@@ -265,7 +265,7 @@ pub fn init_cmd_timer() {
             &ctx,
         )
     };
-    let _ = CMD_TIMER.set(ffi::RawPtr(timer));
+    let _ = CMD_TIMER.set(ffi::ProcessPtr(timer));
     unsafe {
         ffi::CFRunLoopAddTimer(ffi::CFRunLoopGetMain(), timer, ffi::kCFRunLoopCommonModes);
     }
@@ -342,9 +342,9 @@ pub fn start_tap(shared: Arc<Mutex<Core>>) {
         return;
     }
     let source = unsafe { ffi::CFMachPortCreateRunLoopSource(std::ptr::null(), port, 0) };
-    let common = ffi::RawPtr(unsafe { ffi::kCFRunLoopCommonModes });
-    let port = ffi::RawPtr(port as *const std::ffi::c_void);
-    let source = ffi::RawPtr(source as *const std::ffi::c_void);
+    let common = ffi::ThreadPtr(unsafe { ffi::kCFRunLoopCommonModes });
+    let port = ffi::ThreadPtr(port);
+    let source = ffi::ThreadPtr(source);
     std::thread::spawn(move || unsafe {
         ffi::CFRunLoopAddSource(
             ffi::CFRunLoopGetCurrent(),
