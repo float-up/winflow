@@ -16,7 +16,7 @@
 use crate::capture::ThumbCache;
 use crate::config::Config;
 use crate::layout;
-use crate::state::{Core, Item, MainCmd, Mode};
+use crate::state::{Core, Item, MainCmd, Mode, ShowData};
 use crate::{ffi, util, windows};
 use block2::RcBlock;
 use objc2::rc::Retained;
@@ -221,7 +221,8 @@ fn mtm() -> MainThreadMarker {
 impl AppInner {
     fn handle_cmd(&mut self, cmd: MainCmd) {
         match cmd {
-            MainCmd::Show(m) => self.show(m),
+            MainCmd::Show(m, require_cmd_held) => self.show(m, require_cmd_held),
+            MainCmd::ShowReady(d) => self.finish_show(d),
             MainCmd::Redraw => self.redraw(),
             MainCmd::Activate(i) => self.activate(i),
             MainCmd::QuickSwitch(m) => self.quick_switch(m),
@@ -254,7 +255,7 @@ impl AppInner {
 
     // ---------- show / hide ----------
 
-    fn show(&mut self, mode: Mode) {
+    fn show(&mut self, mode: Mode, require_cmd_held: bool) {
         self.ensure_panel();
         self.warn_permissions();
         // A fresh overlay starts without a stale hint from a previous session.
@@ -265,7 +266,8 @@ impl AppInner {
         // Re-detect the display under the cursor: the overlay opens on the
         // display where the hotkey was pressed, scoped to that display's
         // current desktop.
-        self.display_id = 0;
+        self.display_id = unsafe { ffi::cursor_display() };
+        let display_id = self.display_id;
         let front_pid = windows::frontmost_pid();
         self.prev_app_pid = front_pid;
         {
@@ -276,7 +278,61 @@ impl AppInner {
                 Mode::App => core.mru_app.clone(),
             };
         }
-        self.collect_items();
+
+        // The expensive part — CGWindowList enumeration + sanitize — runs on a
+        // background thread so the main run loop isn't blocked while the
+        // overlay is being prepared. The result comes back as `ShowReady`.
+        // (Only CG/CoreFoundation is touched here; `front_pid` was computed on
+        // the main thread because NSWorkspace is AppKit.)
+        let cfg = self.cfg.clone();
+        let prev_app_pid = self.prev_app_pid;
+        let our_pid = std::process::id();
+        std::thread::spawn(move || {
+            let dbounds = unsafe { ffi::display_bounds(display_id) };
+            let items = windows::collect(&cfg, mode, our_pid, dbounds.as_ref(), front_pid);
+            let front_window = prev_app_pid
+                .and_then(|p| items.iter().find(|i| i.pid == p).map(|i| i.id));
+            let last_window_ids = dbounds
+                .map(windows::display_window_ids)
+                .unwrap_or_default();
+            crate::state::dispatch_main(MainCmd::ShowReady(ShowData {
+                mode,
+                display_id,
+                items,
+                front_window,
+                last_window_ids,
+                require_cmd_held,
+            }));
+        });
+    }
+
+    /// Finish showing the overlay once the background collect has returned.
+    fn finish_show(&mut self, data: ShowData) {
+        {
+            let core = self.shared.lock().unwrap();
+            // If this show required ⌘ to stay held and it's no longer held, a
+            // release already dispatched QuickSwitch/Hide while the collect was
+            // in flight — drop the result so the overlay doesn't pop up after
+            // the user let go. Similarly drop a result whose mode no longer
+            // matches (a newer show re-targeted the switcher meanwhile).
+            if (data.require_cmd_held && !core.cmd_held) || core.mode != data.mode {
+                return;
+            }
+        }
+        self.display_id = data.display_id;
+        self.front_window = data.front_window;
+        self.last_window_ids = data.last_window_ids;
+        {
+            let mut core = self.shared.lock().unwrap();
+            core.items = data.items;
+            // Merge the current display's windows into the warm set instead of
+            // replacing it (same logic as collect_items — see the note there
+            // about not scoping `tracked` to one display).
+            let mut ids: HashSet<u32> = core.tracked.iter().copied().collect();
+            ids.extend(core.items.iter().map(|i| i.id));
+            core.tracked = ids.into_iter().collect();
+            core.refresh_all = true;
+        }
         let sel_id = {
             let mut core = self.shared.lock().unwrap();
             // Sync with whatever is currently focused (external switches
@@ -344,7 +400,7 @@ impl AppInner {
         };
         self.display_id = display;
         let dbounds = unsafe { ffi::display_bounds(display) };
-        let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref());
+        let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref(), None);
         // The freshly collected list is in CG order (front-to-back); capture
         // the frontmost window of the front app BEFORE any MRU reorder.
         self.front_window = self
@@ -466,7 +522,7 @@ impl AppInner {
             self.collect_cache.as_ref().unwrap().items.clone()
         } else {
             let dbounds = unsafe { ffi::display_bounds(display) };
-            let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref());
+            let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref(), None);
             self.collect_cache = Some(CollectCache {
                 mode,
                 display_id: display,
@@ -594,7 +650,7 @@ impl AppInner {
             return;
         };
         // Global on-screen set across all displays (current Spaces).
-        let items = windows::collect(&self.cfg, Mode::Space, std::process::id(), None);
+        let items = windows::collect(&self.cfg, Mode::Space, std::process::id(), None, None);
         if let Some(item) = items.iter().find(|i| i.id == id).cloned() {
             self.activate_item(item);
             return;

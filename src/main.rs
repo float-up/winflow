@@ -42,7 +42,7 @@ fn main() {
     if std::env::args().any(|a| a == "--show") {
         std::thread::spawn(|| {
             std::thread::sleep(std::time::Duration::from_secs(2));
-            state::dispatch_main(state::MainCmd::Show(state::Mode::Space));
+            state::dispatch_main(state::MainCmd::Show(state::Mode::Space, false));
         });
     }
     if std::env::args().any(|a| a == "--force-perm-dialog") {
@@ -64,7 +64,7 @@ fn main() {
     // the scheduler's first (~50ms) pass always sees a populated list — there
     // is no race with the initial `CGWindowList` query.
     {
-        let items = winflow::windows::collect(&cfg, state::Mode::Space, std::process::id(), None);
+        let items = winflow::windows::collect(&cfg, state::Mode::Space, std::process::id(), None, None);
         let mut core = shared.lock().unwrap();
         core.tracked = items.iter().map(|i| i.id).collect();
         core.refresh_all = true;

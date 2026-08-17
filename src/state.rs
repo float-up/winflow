@@ -191,7 +191,12 @@ impl Core {
 
 /// Commands dispatched to the main thread.
 pub enum MainCmd {
-    Show(Mode),
+    /// Show the overlay for `mode`. The bool is `require_cmd_held`: when true
+    /// (hotkey paths) a ⌘ release during the async collect aborts the show.
+    Show(Mode, bool),
+    /// A background window-collect finished; carry its result back to the main
+    /// thread to finish showing the overlay (see `overlay::finish_show`).
+    ShowReady(ShowData),
     Redraw,
     Activate(usize),
     /// Quick-tap: switch straight to the previous window without the overlay.
@@ -208,6 +213,18 @@ pub enum MainCmd {
     PermDialog,
     Tick,
     Quit,
+}
+
+/// Result of a background `windows::collect` for the overlay show path.
+pub struct ShowData {
+    pub mode: Mode,
+    pub display_id: u32,
+    pub items: Vec<Item>,
+    pub front_window: Option<u32>,
+    pub last_window_ids: Vec<u32>,
+    /// Whether showing requires ⌘ to still be held (false for the `--show` dev
+    /// aid). When true, a release during the async collect aborts the show.
+    pub require_cmd_held: bool,
 }
 
 // ---------- main-thread command delivery ----------
@@ -402,6 +419,10 @@ impl TapCtx {
                         // without it, taps near the threshold occasionally did
                         // nothing because the overlay had not shown yet.
                         core.quick_pending = false;
+                        // The pending show is cancelled, so it is no longer
+                        // "loading" — clear this too, otherwise the next ⌘Tab
+                        // would never re-arm and the switcher would go dead.
+                        core.quick_show_dispatched = false;
                         dispatch_main(MainCmd::QuickSwitch(core.quick_mode));
                     } else if core.visible {
                         // Releasing ⌘ switches to the window the selection box
@@ -433,7 +454,7 @@ impl TapCtx {
             && keycode == ffi::KVK_TAB
             && mods == (ffi::KCG_EVENT_FLAG_COMMAND | ffi::KCG_EVENT_FLAG_SHIFT)
         {
-            dispatch_main(MainCmd::Show(Mode::Space));
+            dispatch_main(MainCmd::Show(Mode::Space, true));
             return true;
         }
 
@@ -579,7 +600,7 @@ pub fn start_quick_timer(shared: Arc<Mutex<Core>>) {
             let mode = core.quick_mode;
             // `quick_pending` stays set until Show() actually processes, so
             // repeated ⌘Tab keydowns while the overlay loads do not re-arm.
-            dispatch_main(MainCmd::Show(mode));
+            dispatch_main(MainCmd::Show(mode, true));
         }
     });
 }

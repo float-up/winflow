@@ -264,11 +264,17 @@ pub fn window_ids_all() -> HashSet<u32> {
 /// scoped to. Each display's current desktop is its own independent world:
 /// `CGWindowList` is on-screen-only, so once windows are limited to one
 /// display's bounds they are exactly that display's current desktop.
+///
+/// `front_pid` is the frontmost app pid for `Mode::App`. It must be computed
+/// by the caller on the main thread when `collect` runs off-thread
+/// (NSWorkspace is AppKit and must not be touched from a background thread);
+/// `None` lets `collect` query it itself (only valid on the main thread).
 pub fn collect(
     cfg: &Config,
     mode: Mode,
     our_pid: u32,
     display: Option<&(f64, f64, f64, f64)>,
+    front_pid: Option<i32>,
 ) -> Vec<Item> {
     let mut wins = all_windows();
     wins.retain(|w| w.pid != our_pid as i32);
@@ -299,7 +305,10 @@ pub fn collect(
         }
         Mode::App => {
             // Subset of Mode::Space: only the frontmost app's windows.
-            let front = frontmost_pid().unwrap_or(-1);
+            let front = match front_pid {
+                Some(p) => p,
+                None => frontmost_pid().unwrap_or(-1),
+            };
             if front <= 0 || front == our_pid as i32 {
                 return Vec::new();
             }
