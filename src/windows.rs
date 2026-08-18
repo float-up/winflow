@@ -10,6 +10,16 @@ use objc2::{msg_send, ClassType};
 use objc2_app_kit::{NSRunningApplication, NSWorkspace};
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Copy, Debug)]
+pub struct FocusSnapshot {
+    /// Frontmost application.
+    pub pid: i32,
+    /// Exact focused CG window id when AX/CG can resolve it.
+    pub window_id: Option<u32>,
+    /// Display containing the focused window's center.
+    pub display_id: Option<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Win {
     pub id: u32,
@@ -475,15 +485,12 @@ fn ax_raise_window(item: &Item) -> bool {
         }
     }
 
-    // Raising OR focusing the specific window is what matters for bringing it
-    // forward; either success keeps us on `ActivateIgnoringOtherApps` so we
-    // don't surface the wrong window via `ActivateAllWindows`.
-    let raise_ok = if !target.is_null() {
-        unsafe { ffi::AXUIElementPerformAction(target, ffi::cstr_static("AXRaise")) == 0 }
-    } else {
-        false
-    };
-    let focus_ok = if !target.is_null() {
+    // First make the selected AX window the process's own front window, then
+    // activate ONLY that window. AXFrontmost and NSRunningApplication activation
+    // are process-wide and make every VSCode/Electron window surface on every
+    // display. Carbon's deprecated-but-still-exported FrontWindowOnly option is
+    // specifically designed to avoid that behavior.
+    let prefocus_ok = if !target.is_null() {
         unsafe {
             ffi::AXUIElementSetAttributeValue(app, ffi::cstr_static("AXFocusedWindow"), target)
                 == 0
@@ -491,7 +498,48 @@ fn ax_raise_window(item: &Item) -> bool {
     } else {
         false
     };
-    let ok = raise_ok || focus_ok;
+    let preraise_ok = if !target.is_null() {
+        unsafe { ffi::AXUIElementPerformAction(target, ffi::cstr_static("AXRaise")) == 0 }
+    } else {
+        false
+    };
+    let front_ok = if !target.is_null() && (prefocus_ok || preraise_ok) {
+        let mut psn = ffi::ProcessSerialNumber::default();
+        unsafe {
+            ffi::GetProcessForPID(item.pid, &mut psn) == 0
+                && ffi::SetFrontProcessWithOptions(
+                    &psn,
+                    ffi::KSET_FRONT_PROCESS_FRONT_WINDOW_ONLY,
+                ) == 0
+        }
+    } else {
+        false
+    };
+
+    // Reassert after process activation because Electron can update its key
+    // window while coming front.
+    let focus_ok = if front_ok {
+        unsafe {
+            ffi::AXUIElementSetAttributeValue(app, ffi::cstr_static("AXFocusedWindow"), target)
+                == 0
+        }
+    } else {
+        false
+    };
+    let raise_ok = if front_ok {
+        unsafe { ffi::AXUIElementPerformAction(target, ffi::cstr_static("AXRaise")) == 0 }
+    } else {
+        false
+    };
+    let refocus_ok = if front_ok {
+        unsafe {
+            ffi::AXUIElementSetAttributeValue(app, ffi::cstr_static("AXFocusedWindow"), target)
+                == 0
+        }
+    } else {
+        false
+    };
+    let ok = front_ok && (focus_ok || raise_ok || refocus_ok);
     unsafe {
         ffi::cf_release(val);
         ffi::cf_release(app);
@@ -509,22 +557,46 @@ pub fn activate_item(item: &Item) {
     // (which would wrongly raise the other displays' windows too).
     let multi = item.n_same_pid > 1;
     let ax_ok = if multi { ax_raise_window(item) } else { false };
-    if multi && !ax_ok {
-        util::log(&format!(
-            "AX raise failed for [{}] {} (pid {}) — falling back to app activation",
-            item.id, item.owner, item.pid
-        ));
+    if multi {
+        if !ax_ok {
+            // Never fall back to ActivateAllWindows for an ambiguous app: it
+            // can focus that app's last-used window on another display, which
+            // is worse than leaving focus unchanged. Missing AX permission is
+            // handled separately below as the documented degraded mode.
+            util::log(&format!(
+                "AX exact activation failed for [{}] {} (pid {}); refusing cross-display fallback",
+                item.id, item.owner, item.pid
+            ));
+            if !ax_available() {
+                if let Some(app) = running_app(item.pid) {
+                    unsafe {
+                        let _: bool = msg_send![&app, activateWithOptions: 3u64];
+                    }
+                }
+            }
+        }
+        // Successful multi-window activation was completed with
+        // FrontWindowOnly + exact AX focus. A later process-wide activation
+        // would surface same-app windows on other displays and race the target.
+        return;
     }
+
+    // A truly single-window app has no cross-display ambiguity.
     if let Some(app) = running_app(item.pid) {
-        let opts = if ax_ok {
-            2u64 // ActivateIgnoringOtherApps
-        } else {
-            3u64 // | ActivateAllWindows
-        };
         unsafe {
-            let _: bool = msg_send![&app, activateWithOptions: opts];
+            let _: bool = msg_send![&app, activateWithOptions: 3u64];
         }
     }
+}
+
+/// Reassert a specific multi-window target after application activation has
+/// settled. Refuse to act if another application is now frontmost, so a
+/// delayed retry can never steal focus back from an external user switch.
+pub fn refocus_item(item: &Item) -> bool {
+    if frontmost_pid() != Some(item.pid) {
+        return false;
+    }
+    ax_raise_window(item)
 }
 
 pub fn running_app(pid: i32) -> Option<Retained<NSRunningApplication>> {
@@ -543,6 +615,72 @@ pub fn frontmost_pid() -> Option<i32> {
         let front: Option<Retained<NSRunningApplication>> = msg_send![&ws, frontmostApplication];
         front.map(|a| msg_send![&a, processIdentifier])
     }
+}
+
+/// Snapshot the globally focused window and the display that contains it.
+///
+/// The frontmost PID comes from NSWorkspace; `AXFocusedWindow` then identifies
+/// the exact window within a multi-window app. Its AX bounds are enough to
+/// choose a display. If AX is temporarily unavailable, fall back to the first
+/// on-screen layer-0 CG window of the frontmost process (CG order is
+/// front-to-back). Call this on the main thread because `frontmost_pid` uses
+/// AppKit.
+pub fn focus_snapshot() -> Option<FocusSnapshot> {
+    let pid = frontmost_pid()?;
+    if pid <= 0 {
+        return None;
+    }
+
+    let mut window_id = None;
+    let mut bounds = None;
+    if ax_available() {
+        let app = unsafe { ffi::AXUIElementCreateApplication(pid) };
+        if !app.is_null() {
+            let mut focused: ffi::CFTypeRef = std::ptr::null();
+            let err = unsafe {
+                ffi::AXUIElementCopyAttributeValue(
+                    app,
+                    ffi::cstr_static("AXFocusedWindow"),
+                    &mut focused,
+                )
+            };
+            if err == 0 && !focused.is_null() {
+                let ax = focused as ffi::AXUIElementRef;
+                let mut id: ffi::CGWindowID = 0;
+                if unsafe { ffi::_AXUIElementGetWindow(ax, &mut id) } == 0 && id != 0 {
+                    window_id = Some(id);
+                }
+                bounds = unsafe { ffi::ax_window_bounds(focused) };
+            }
+            unsafe {
+                ffi::cf_release(focused);
+                ffi::cf_release(app);
+            }
+        }
+    }
+
+    // Fill any AX gaps from the CG list. Prefer the exact AX-derived id; when
+    // that is unavailable, CG's first matching layer-0 window is the best
+    // front-to-back fallback for this process.
+    if window_id.is_none() || bounds.is_none() {
+        let wins = all_windows();
+        let candidate = window_id
+            .and_then(|id| wins.iter().find(|w| w.id == id))
+            .or_else(|| {
+                wins.iter().find(|w| {
+                    w.pid == pid && w.layer == 0 && w.onscreen && w.w > 1.0 && w.h > 1.0
+                })
+            });
+        if let Some(w) = candidate {
+            window_id.get_or_insert(w.id);
+            bounds.get_or_insert((w.x, w.y, w.w, w.h));
+        }
+    }
+
+    let display_id = bounds.and_then(|(x, y, w, h)| unsafe {
+        ffi::display_at_point(ffi::CGPoint { x: x + w / 2.0, y: y + h / 2.0 })
+    });
+    Some(FocusSnapshot { pid, window_id, display_id })
 }
 
 /// Open a System Settings pane URL once (best-effort).

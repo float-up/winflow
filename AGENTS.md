@@ -17,10 +17,12 @@ hjkl / 方向键 / 鼠标 多种切换方式。
    - **快捷键固定且覆盖系统**：HID 层事件 tap 必须吞掉 `⌘Tab`/`⌘\`` 的
      keydown，阻止系统切换器与系统窗口循环出现。`⌘⇧Tab` 打开模式 1
      （向后）。禁止把热键改回可配置。
-2. **每个桌面是一个空间，且按显示器独立**。唤醒切换器时，只展示**按下
-   快捷键所在显示器**当前 Space 上的窗口（叠加层也出现在该显示器上）；
-   每个显示器的每个桌面都是独立世界，跨显示器/跨 Space 的窗口不出现。
-   叠加层打开期间若该显示器桌面切换（窗口集合变化），自动刷新列表。
+2. **每个桌面是一个空间，且按显示器独立**。唤醒切换器时，只展示**当前
+   聚焦窗口所在显示器**当前 Space 上的窗口（叠加层也出现在该显示器上）；
+   显示器通过前台程序的 `AXFocusedWindow` 确定，只有无法解析聚焦窗口时才
+   回退到鼠标所在显示器。每个显示器的每个桌面都是独立世界，跨显示器/
+   跨 Space 的窗口不出现。叠加层打开期间若该显示器桌面切换（窗口集合
+   变化），自动刷新列表。
 3. **缩略图等高、不等宽**：每个窗口缩略图高度一致，宽度按窗口实际
    宽高比计算，因此一行可以放多个窗口。
 4. **边界环绕导航**：方向键/hjkl 移动到网格上下左右边缘后，继续按键会
@@ -103,7 +105,14 @@ hjkl / 方向键 / 鼠标 多种切换方式。
   NSImage 缓存只在主线程持有（`thumb_ns`，按 gen 失效）。
 - **ObjC 调用注意事项**：`msg_send!` 的多参数 selector 必须用冒号形式
   并在参数间加逗号（`initWithContentRect: rect, styleMask: ...`）；
-  `setActivationPolicy:` / `activateWithOptions:` 实际返回 BOOL；
+  `setActivationPolicy:` / `activateWithOptions:` 实际返回 BOOL；多窗口程序的
+  精确激活必须先以 `AXFocusedWindow + AXRaise` 选定进程内前窗，再调用
+  `SetFrontProcessWithOptions(kSetFrontProcessFrontWindowOnly)`，最后重复
+  `AXFocusedWindow + AXRaise + AXFocusedWindow`。禁止使用 `AXFrontmost` 或随后
+  调用 `activateWithOptions:`：前者会让同程序在所有显示器上的窗口一起浮出，
+  后者会让 VSCode/Electron 异步恢复另一显示器上的旧聚焦窗口。并在 50ms/
+  150ms 后通过带 generation 的主线程命令重新确认焦点，重试前须确认目标程序
+  仍为前台；
   `kCGWindowIsOnscreen` 是 CFBoolean 不是 CFNumber；Rust 2021 闭包
   对 `ptr.0` 这类字段访问会做 disjoint capture（导致 raw pointer 无法
   Send），跨线程移动指针时用 `ThreadPtr::get()` 之类的封装方法访问。
@@ -168,7 +177,8 @@ hjkl / 方向键 / 鼠标 多种切换方式。
 - 不显示最小化窗口（CGWindowList on-screen only）。
 - 缩略图只在窗口内容变化后按 `capture_interval` 刷新，不监听窗口
   content 变化事件。
-- 叠加层显示在按下快捷键的显示器上（按光标所在显示器确定，见 `ffi::cursor_display`），
-  居中于该显示器。
+- 叠加层显示在当前聚焦窗口所在显示器上（`windows::focus_snapshot` 通过
+  前台 PID + `AXFocusedWindow` 确定）；仅在无法解析聚焦窗口时回退到
+  `ffi::cursor_display`，并居中于该显示器。
 - 设置持久化：面板修改的截图间隔/快捷判定延迟保存到
   `~/Library/Application Support/winflow/settings.conf`，重启保持。

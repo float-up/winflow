@@ -199,6 +199,9 @@ pub enum MainCmd {
     ShowReady(ShowData),
     Redraw,
     Activate(usize),
+    /// Reassert an exact multi-window AX target after app activation settles.
+    /// The generation prevents a delayed retry from overriding a newer switch.
+    Refocus(Item, u64),
     /// Quick-tap: switch straight to the previous window without the overlay.
     QuickSwitch(Mode),
     Hide,
