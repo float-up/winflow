@@ -1,6 +1,6 @@
 [package]
 name = "winflow"
-version = "0.0.3"
+version = "0.1.0"
 edition = "2021"
 description = "A lightweight macOS window switcher with live thumbnails, LRU ordering and hjkl/arrow/mouse navigation."
 

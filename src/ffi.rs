@@ -64,6 +64,18 @@ pub struct CGRect {
     pub size: CGSize,
 }
 
+/// Legacy Process Manager identifier used by
+/// `SetFrontProcessWithOptions(kSetFrontProcessFrontWindowOnly)`. The API is
+/// deprecated but still exported by ApplicationServices on current macOS and
+/// is the only public-ish way to activate one window without surfacing every
+/// same-app window on other displays.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ProcessSerialNumber {
+    pub high_long_of_psn: u32,
+    pub low_long_of_psn: u32,
+}
+
 impl CGRect {
     pub fn null() -> CGRect {
         CGRect {
@@ -83,6 +95,9 @@ pub const KCG_WINDOW_LIST_OPTION_ON_SCREEN_ONLY: u32 = 1 << 0;
 pub const KCG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
 pub const KCG_WINDOW_LIST_OPTION_EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
 pub const KCG_WINDOW_IMAGE_OPTION_BOUNDS_IGNORE_FRAMING: u32 = 1 << 0;
+/// Carbon Process Manager: activate only the process's front window, rather
+/// than bringing all its windows forward across all displays.
+pub const KSET_FRONT_PROCESS_FRONT_WINDOW_ONLY: u32 = 1 << 0;
 
 pub const KCG_HID_EVENT_TAP: u32 = 0;
 pub const KCG_HEAD_INSERT_EVENT_TAP: u32 = 0;
@@ -342,6 +357,8 @@ extern "C" {
     ) -> i32;
     pub fn AXUIElementPerformAction(element: AXUIElementRef, action: CFStringRef) -> i32;
     pub fn AXValueGetValue(value: CFTypeRef, type_: u32, valuePtr: *mut c_void) -> bool;
+    pub fn GetProcessForPID(pid: i32, psn: *mut ProcessSerialNumber) -> i32;
+    pub fn SetFrontProcessWithOptions(psn: *const ProcessSerialNumber, options: u32) -> i32;
     /// Private-but-stable SPI: map an AX window element to its CGWindowID
     /// (kAXErrorSuccess = 0 writes the id). More authoritative than matching by
     /// bounds, which can confuse same-size windows of one app across displays.
@@ -377,30 +394,37 @@ pub unsafe fn active_space() -> Option<i64> {
     }
 }
 
-/// The display under the mouse cursor (falls back to the main display).
-/// Iterates ONLINE displays and picks the one whose bounds contain the
-/// cursor. (`CGGetDisplaysWithPoint` can report phantom/offline displays
-/// that overlap the real ones on some setups, so it is not used.)
-pub unsafe fn cursor_display() -> CGDirectDisplayID {
-    let event = CGEventCreate(std::ptr::null());
-    if !event.is_null() {
-        let p = CGEventGetLocation(event);
-        CFRelease(event as *const c_void);
-        let mut ids = [0u32; 8];
-        let mut n: u32 = 0;
-        CGGetOnlineDisplayList(8, ids.as_mut_ptr(), &mut n);
-        for i in 0..n as usize {
-            let b = CGDisplayBounds(ids[i]);
-            if p.x >= b.origin.x
-                && p.x < b.origin.x + b.size.width
-                && p.y >= b.origin.y
-                && p.y < b.origin.y + b.size.height
-            {
-                return ids[i];
-            }
+/// Find the online display containing a point in global CG coordinates.
+/// Iterating ONLINE displays avoids the phantom/offline displays that
+/// `CGGetDisplaysWithPoint` can report on some setups.
+pub unsafe fn display_at_point(p: CGPoint) -> Option<CGDirectDisplayID> {
+    let mut ids = [0u32; 8];
+    let mut n: u32 = 0;
+    if CGGetOnlineDisplayList(8, ids.as_mut_ptr(), &mut n) != 0 {
+        return None;
+    }
+    for &id in ids.iter().take(n as usize) {
+        let b = CGDisplayBounds(id);
+        if p.x >= b.origin.x
+            && p.x < b.origin.x + b.size.width
+            && p.y >= b.origin.y
+            && p.y < b.origin.y + b.size.height
+        {
+            return Some(id);
         }
     }
-    CGMainDisplayID()
+    None
+}
+
+/// The display under the mouse cursor (falls back to the main display).
+pub unsafe fn cursor_display() -> CGDirectDisplayID {
+    let event = CGEventCreate(std::ptr::null());
+    if event.is_null() {
+        return CGMainDisplayID();
+    }
+    let p = CGEventGetLocation(event);
+    CFRelease(event as *const c_void);
+    display_at_point(p).unwrap_or_else(|| CGMainDisplayID())
 }
 
 /// Frame of a display in global CG coordinates (top-left origin, the same

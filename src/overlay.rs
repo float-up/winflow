@@ -49,8 +49,8 @@ pub struct AppInner {
     thumb_ns: HashMap<u32, (u64, ffi::MainThreadPtr)>,
     /// App pid that was frontmost right before the overlay opened.
     prev_app_pid: Option<i32>,
-    /// Frontmost window id on the overlay's display (CG order, before the MRU
-    /// reorder), used to sync `active` for multi-window apps like VSCode.
+    /// Focused window id on the overlay's display (resolved by AX, with CG
+    /// order as fallback), used to sync `active` for multi-window apps.
     front_window: Option<u32>,
     /// Last `windows::collect` result, reused by `quick_switch` for rapid A↔B
     /// toggling on the same display/mode.
@@ -62,6 +62,9 @@ pub struct AppInner {
     last_redraw: Instant,
     /// When we last activated a window ourselves (quick-switch lag guard).
     last_activate: Option<Instant>,
+    /// Monotonic token for delayed exact-window focus retries. A newer switch
+    /// invalidates retries queued by an older one.
+    activation_gen: u64,
     /// Coalesced thumbnail redraw pending (set by ThumbUpdated).
     thumb_dirty: bool,
     /// Last thumbnail-cache GC time.
@@ -150,6 +153,7 @@ pub fn init_app(cfg: Config, shared: Arc<Mutex<Core>>, thumbs: Arc<RwLock<ThumbC
         scroll_acc: 0.0,
         last_redraw: Instant::now() - std::time::Duration::from_secs(1),
         last_activate: None,
+        activation_gen: 0,
         thumb_dirty: false,
         last_gc: Instant::now(),
         last_fingerprint: Instant::now(),
@@ -222,6 +226,11 @@ impl AppInner {
             MainCmd::ShowReady(d) => self.finish_show(d),
             MainCmd::Redraw => self.redraw(),
             MainCmd::Activate(i) => self.activate(i),
+            MainCmd::Refocus(item, gen) => {
+                if self.activation_gen == gen {
+                    windows::refocus_item(&item);
+                }
+            }
             MainCmd::QuickSwitch(m) => self.quick_switch(m),
             MainCmd::Hide => self.hide(true),
             MainCmd::ThumbUpdated(id) => {
@@ -260,12 +269,17 @@ impl AppInner {
         // The overlay re-collects the window set below; drop any stale
         // quick-switch cache so a later quick tap re-enumerates fresh.
         self.collect_cache = None;
-        // Re-detect the display under the cursor: the overlay opens on the
-        // display where the hotkey was pressed, scoped to that display's
-        // current desktop.
-        self.display_id = unsafe { ffi::cursor_display() };
+        // Scope the switcher to the display containing the currently focused
+        // window. Mouse position is only a fallback when no focused window can
+        // be resolved (e.g. Finder's bare desktop). This keeps keyboard intent
+        // stable when the pointer drifts onto another monitor.
+        let focus = windows::focus_snapshot();
+        let front_pid = focus.map(|f| f.pid);
+        let focused_window = focus.and_then(|f| f.window_id);
+        self.display_id = focus
+            .and_then(|f| f.display_id)
+            .unwrap_or_else(|| unsafe { ffi::cursor_display() });
         let display_id = self.display_id;
-        let front_pid = windows::frontmost_pid();
         self.prev_app_pid = front_pid;
         {
             let mut core = self.shared.lock().unwrap();
@@ -287,8 +301,12 @@ impl AppInner {
         std::thread::spawn(move || {
             let dbounds = unsafe { ffi::display_bounds(display_id) };
             let items = windows::collect(&cfg, mode, our_pid, dbounds.as_ref(), front_pid);
-            let front_window = prev_app_pid
-                .and_then(|p| items.iter().find(|i| i.pid == p).map(|i| i.id));
+            let front_window = focused_window
+                .filter(|id| items.iter().any(|i| i.id == *id))
+                .or_else(|| {
+                    prev_app_pid
+                        .and_then(|p| items.iter().find(|i| i.pid == p).map(|i| i.id))
+                });
             let last_window_ids = dbounds
                 .map(windows::display_window_ids)
                 .unwrap_or_default();
@@ -335,9 +353,9 @@ impl AppInner {
             // Sync with whatever is currently focused (external switches
             // count too): the frontmost window becomes the active one, the
             // previously active becomes `prev` (the first/selected item when
-            // the overlay opens). `self.front_window` was captured from CG
-            // order (front-to-back) before the MRU reorder so it is the REAL
-            // frontmost window even for multi-window apps (VSCode).
+            // the overlay opens). `self.front_window` is the exact AX-focused
+            // window captured before winflow takes focus, so multi-window apps
+            // such as VSCode sync to the correct display/window.
             let f_id = self.front_window;
             if let Some(f) = f_id {
                 if core.active != Some(f) {
@@ -387,13 +405,14 @@ impl AppInner {
     /// Ordering/layout is done separately by `layout_items`.
     fn collect_items(&mut self) {
         let mode = self.shared.lock().unwrap().mode;
-        // Target display: the one the hotkey was pressed on (cursor), or the
-        // display the overlay is already shown for when re-collecting (space
-        // change refresh).
+        // Keep the display chosen when the overlay opened. The fallback path
+        // is only for an uninitialized/dev-triggered recollect.
         let display = if self.display_id != 0 {
             self.display_id
         } else {
-            unsafe { ffi::cursor_display() }
+            windows::focus_snapshot()
+                .and_then(|f| f.display_id)
+                .unwrap_or_else(|| unsafe { ffi::cursor_display() })
         };
         self.display_id = display;
         let dbounds = unsafe { ffi::display_bounds(display) };
@@ -495,7 +514,24 @@ impl AppInner {
             persist_mru(&mut core);
         }
         self.last_activate = Some(Instant::now());
+        self.activation_gen = self.activation_gen.wrapping_add(1);
+        let gen = self.activation_gen;
         windows::activate_item(&item);
+
+        // VSCode/Electron may asynchronously restore its previously focused
+        // window just after the app comes front, overwriting the exact AX target
+        // (often with a window on another display). Reassert after activation
+        // settles. The main-thread handler checks both `gen` and frontmost PID,
+        // so retries cannot steal focus back after a newer/external switch.
+        if item.n_same_pid > 1 && windows::ax_available() {
+            let retry = item.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                crate::state::dispatch_main(MainCmd::Refocus(retry.clone(), gen));
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                crate::state::dispatch_main(MainCmd::Refocus(retry, gen));
+            });
+        }
         self.hide(false);
     }
 
@@ -508,7 +544,11 @@ impl AppInner {
     /// (the frontmost query lags briefly and would otherwise be misread as an
     /// external switch).
     fn quick_switch(&mut self, mode: Mode) {
-        let display = unsafe { ffi::cursor_display() };
+        let focus = windows::focus_snapshot();
+        let front_pid = focus.map(|f| f.pid);
+        let display = focus
+            .and_then(|f| f.display_id)
+            .unwrap_or_else(|| unsafe { ffi::cursor_display() });
         // Reuse a recent collect for the same display/mode so a rapid A↔B
         // toggle doesn't re-enumerate + sanitize the full CG window list on
         // every tap. Stale caches fall back to a fresh collect.
@@ -519,7 +559,13 @@ impl AppInner {
             self.collect_cache.as_ref().unwrap().items.clone()
         } else {
             let dbounds = unsafe { ffi::display_bounds(display) };
-            let items = windows::collect(&self.cfg, mode, std::process::id(), dbounds.as_ref(), None);
+            let items = windows::collect(
+                &self.cfg,
+                mode,
+                std::process::id(),
+                dbounds.as_ref(),
+                front_pid,
+            );
             self.collect_cache = Some(CollectCache {
                 mode,
                 display_id: display,
@@ -542,9 +588,12 @@ impl AppInner {
             .last_activate
             .is_some_and(|t| t.elapsed() < ACTIVATE_GRACE);
 
-        let front_pid = windows::frontmost_pid();
-        let front = front_pid
-            .and_then(|p| items.iter().find(|i| i.pid == p).map(|i| i.id))
+        let front = focus
+            .and_then(|f| f.window_id)
+            .filter(|id| present(*id))
+            .or_else(|| {
+                front_pid.and_then(|p| items.iter().find(|i| i.pid == p).map(|i| i.id))
+            })
             .or_else(|| items.first().map(|i| i.id));
 
         // Currently focused window: trust our own recent activation; otherwise
@@ -701,8 +750,8 @@ impl AppInner {
             // matches the target display. The size-only check let the panel
             // stay on the display of a previous show whenever two shows
             // produced the same layout size (equal-width displays + same row
-            // count), so the overlay appeared on the startup desktop no
-            // matter where the cursor was. (The panel is not user-draggable,
+            // count), so the overlay appeared on the startup desktop instead
+            // of the focused window's display. (The panel is not user-draggable,
             // so recentering on every mismatch is always safe.)
             let size_changed =
                 (cur.size.width - w).abs() > 0.5 || (cur.size.height - h).abs() > 0.5;
